@@ -32,7 +32,9 @@
     "helper-missing": "Helper not found",
     "read-failed": "Failed to read status",
     "parse": "Could not parse helper output",
-    "write-failed": "Failed to set fan speed"
+    "write-failed": "Failed to set fan speed",
+    "invalid-args": "Helper rejected its arguments",
+    "helper-stuck": "Helper is not responding; waiting for it to return"
   },
   "curve": {
     "quiet": "Quiet",

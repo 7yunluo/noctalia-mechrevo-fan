@@ -1,24 +1,47 @@
 --!nonstrict
 -- Mechrevo Fan Control 后台服务。
 --
--- 职责:
---   1. 周期调 mechrevo-fanctl status 读取风扇占空比/EC 温度,发布到插件共享状态
---   2. 收到命令时调 mechrevo-fanctl set / auto 写风扇
---   3. manual/curve 模式下周期重施目标值,抵消 EC 固件自行调整
---   4. 过热保护:达到 safety_temp_c 时立刻交还 EC 自动模式
+-- 分区: CONFIG / STATE MODEL / EC TRANSPORT / EC SCHEDULER / MODE ENGINE /
+--       PUBLISH / LIFECYCLE
+--
+-- 硬不变式:
+--   1. 只有 EC SCHEDULER 发起 helper 子进程;
+--   2. 只有 MODE ENGINE 修改 desired 意图;
+--   3. 只有 PUBLISH 写 UI 通道;
+--   4. 任何「置位」与「写 EC」不写在同一函数里。
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- 1. CONFIG & CONSTANTS
+-- ══════════════════════════════════════════════════════════════════════════
 
 local SNAPSHOT = "mechrevo_fan.status"
 local COMMAND = "mechrevo_fan.command"
-local LAST = "mechrevo_fan.last"
 
 local MODE_AUTO = "auto"
 local MODE_MANUAL = "manual"
 local MODE_CURVE = "curve"
 
-local RAW_MAX = 200 -- 100% 对应的原始占空比值(驱动 NB02_FAN_SPEED_MAX=0xc8)
-local TICK_MS = 2000
+local RAW_MAX = 200 -- 100% 对应的原始占空比(驱动 NB02_FAN_SPEED_MAX=0xc8)
+local RAW_STEP = 5 -- 触发一次写的 raw 最小变化量
+local RAW_ZERO_FLOOR = 1 -- 0 归一化为 1,避免 EC 数分钟后自行抬升
 
--- 温度-转速曲线(原始值 0-200)
+-- 调度节奏:宿主 tick 固定,读节奏由 poll_interval_ms 决定
+local SCHED_TICK_MS = 250
+local WRITE_DEBOUNCE_MS = 500 -- 写请求合并窗口
+local EC_WRITE_MIN_INTERVAL_MS = 2000 -- 两次真实 EC 写的最小间隔
+local TEMP_REAPPLY_DELTA_C = 2 -- 曲线模式下重算目标的温度变化阈值
+local POST_WRITE_SETTLE_MS = 1500 -- 写完成后延迟多久才允许读
+local USER_INTENT_BYPASS_MS = 1000 -- 用户主动操作可穿透去抖的窗口
+
+local BACKOFF_BASE_MS = 2000 -- 失败退避基数
+local BACKOFF_MAX_MS = 60000 -- 失败退避上限
+local SILENT_PROBE_MS = 60000 -- 静默/卡死态的慢探间隔
+
+-- 看门狗阈值,同时用作 runAsync 超时
+local WATCHDOG_MS = { read = 5000, write = 8000, auto = 4000 }
+
+local DEFAULT_HELPER = "~/.local/bin/mechrevo-fanctl"
+
 local CURVES = {
   quiet = {
     { temp = 45, raw = 0 },
@@ -49,104 +72,54 @@ local CURVES = {
   },
 }
 
-local status = {
-  ok = false,
-  fan0 = -1,
-  fan1 = -1,
-  temp0 = -1,
-  temp1 = -1,
-  mode = 0,
-  minSpeed = 25,
-  scale = RAW_MAX,
-  modeName = MODE_AUTO,
-  targetRaw = 0,
-  appliedRaw = 0,
-  curve = "balanced",
-  sensor = "cpu",
-  safetyTempC = 95,
-  error = "",
-}
-
-local last = noctalia.state.get(LAST) or {}
-local isLive = last.live == true
-local desiredMode = last.mode or MODE_AUTO
-local desiredRaw = tonumber(last.raw) or 0
-local desiredCurve = last.curve -- 面板里选过的曲线,优先于设置项
-local backendState = nil -- nil=未探测, true=可用, false=不可用
-
-local reading = false
-local writing = false
-local pendingRaw = nil -- 写入进行中收到的最新目标值
-local safetyNotified = false -- 过热通知节流,温度回落后重置
-local sensorWarned = false -- 温度无效警告节流,温度恢复后重置
+-- ══════════════════════════════════════════════════════════════════════════
+-- 2. STATE MODEL
+-- ══════════════════════════════════════════════════════════════════════════
 
 local function cfg(key)
   return noctalia.getConfig(key)
 end
 
-local DEFAULT_HELPER = "~/.local/bin/mechrevo-fanctl"
-
--- 展开路径开头的 ~,以 HOME 环境变量为基准
-local function expandHome(path)
-  if type(path) ~= "string" or path:sub(1, 1) ~= "~" then
-    return path
-  end
-  local home = noctalia.getenv("HOME")
-  if type(home) ~= "string" or home == "" then
-    return path
-  end
-  if path == "~" then
-    return home
-  end
-  if path:sub(1, 2) == "~/" then
-    return home .. path:sub(2)
-  end
-  return path
+local function now()
+  return noctalia.nowMs()
 end
 
--- 校验 helper 路径:展开 ~,只放行安全字符,非法时返回 nil
-local function sanitizeHelper(path)
-  path = expandHome(path)
-  if type(path) ~= "string" or not path:match("^[A-Za-z0-9/_.~%-]+$") then
-    return nil
-  end
-  return path
-end
+-- 意图:用户/策略想要什么。只由 MODE ENGINE 修改
+local desired = {
+  mode = MODE_AUTO,
+  raw = 0, -- 手动档滑块值(原样保留,0 不做归一化)
+  targetRaw = nil, -- 当前模式下真正要下发的目标(已归一化)
+  curve = nil, -- 面板选过的曲线,优先于设置项
+  sensor = "cpu",
+  safety_c = 95,
+}
 
--- 读取配置里的 helper 路径;未配置或配置非法时返回 nil
-local function helperPath()
-  local path = cfg("helper_path")
-  if type(path) ~= "string" or path == "" then
-    path = DEFAULT_HELPER
-  end
-  return sanitizeHelper(path)
-end
+-- 实测:硬件当前是什么。只由读回调修改
+local actual = {
+  fan0 = -1,
+  fan1 = -1,
+  temp0 = -1,
+  temp1 = -1,
+  mode_reg = 0,
+  minSpeed = 25,
+  lastReadAt = 0,
+}
 
--- 拼 helper 命令用的路径;非法路径返回 nil,调用方按 helper-missing 处理
-local function helperQuoted()
-  local path = helperPath()
-  if not path then
-    return nil
-  end
-  -- 白名单已排除单引号,整体再套单引号即可安全插入 shell 命令
-  return "'" .. path .. "'"
-end
+-- 健康:后端可用性与错误。只由传输层结果修改
+local health = {
+  ok = false,
+  writable = true,
+  error = "",
+  backoff_n = 0,
+  backoffUntil = 0,
+  stuck = false,
+  silent = false,
+}
 
--- 解析可用的 helper 命令:先试用户配置,非法则退回默认路径。
--- 第二个返回值表示是否用了默认路径兜底;两者都不可用时返回 nil。
-local function resolveHelperQuoted()
-  local path = helperPath()
-  if path then
-    return "'" .. path .. "'", false
-  end
-  path = sanitizeHelper(DEFAULT_HELPER)
-  if not path then
-    return nil, false
-  end
-  return "'" .. path .. "'", true
-end
+-- ══════════════════════════════════════════════════════════════════════════
+-- 3. EC TRANSPORT
+-- ══════════════════════════════════════════════════════════════════════════
 
--- 已知错误码 -> 翻译键,未知码原样输出
 local ERROR_CODES = {
   ["device-missing"] = true,
   ["permission-denied"] = true,
@@ -154,8 +127,11 @@ local ERROR_CODES = {
   ["read-failed"] = true,
   ["parse"] = true,
   ["write-failed"] = true,
+  ["invalid-args"] = true,
+  ["helper-stuck"] = true,
 }
 
+-- 错误码 -> 已翻译文本,未知码原样输出
 local function errText(code)
   if ERROR_CODES[code] then
     return noctalia.tr("error." .. code)
@@ -163,16 +139,365 @@ local function errText(code)
   return code
 end
 
--- 判断温度是否可用,<=0 或非数字视为无效(部分机型温度通道恒为 0)
+-- 解析 helper 可执行文件路径(全网唯一一处)
+local function resolveHelperPath()
+  local path = cfg("helper_path")
+  if type(path) ~= "string" or path == "" then
+    path = DEFAULT_HELPER
+  end
+  local expanded = noctalia.expandPath(path)
+  if type(expanded) ~= "string" or expanded == "" then
+    return nil
+  end
+  return expanded
+end
+
+-- 目标值归一化:clamp 到 0..200,0 抬到 1
+local function normalizeRaw(raw)
+  local n = math.floor((tonumber(raw) or 0) + 0.5)
+  if n < 0 then
+    n = 0
+  elseif n > RAW_MAX then
+    n = RAW_MAX
+  end
+  if n == 0 then
+    n = RAW_ZERO_FLOOR
+  end
+  return n
+end
+
 local function tempValid(temp)
   return temp ~= nil and temp == temp and temp > 0
 end
 
--- 取当前传感器温度;无效时返回非正值,由调用方决定如何处理
+-- 组装 argv(API 24,无 shell)
+local function buildArgv(path, op)
+  if op.kind == "read" then
+    return { path, "status" }
+  elseif op.kind == "auto" then
+    return { path, "auto" }
+  end
+  -- 写两个风扇占空比
+  local raw = tostring(op.raw)
+  return { path, "set", "0", raw, "&&", path, "set", "1", raw }
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- 4. EC SCHEDULER
+-- ══════════════════════════════════════════════════════════════════════════
+
+local inFlight = nil -- { id, kind, raw, startedAt, probe }
+local opSeq = 0
+local pendingWrite = nil -- { raw }
+local writeDueAt = nil
+local lastWriteAt = 0
+local appliedRaw = nil -- EC 已确认的占空比
+local appliedMode = MODE_AUTO -- EC 已确认的控制模式
+local statusEarliestAt = 0
+local nextReadAt = 0
+local probeAt = 0
+local userIntentUntil = 0
+
+-- 标记用户主动操作,允许一次穿透去抖
+local function schedulerMarkUserIntent()
+  userIntentUntil = now() + USER_INTENT_BYPASS_MS
+end
+
+-- 把下次读提前,允许穿透退避
+local function schedulerRequestRead()
+  nextReadAt = 0
+end
+
+local function pollInterval()
+  local v = tonumber(cfg("poll_interval_ms")) or 2000
+  if v < 1000 then
+    v = 1000
+  elseif v > 60000 then
+    v = 60000
+  end
+  return v
+end
+
+-- rc / 情况 -> 错误码 + 是否致命(致命进静默慢探)
+local function classify(result)
+  if result.spawnFailed or result.exitCode == 127 then
+    return "helper-missing", true
+  end
+  local rc = result.exitCode
+  if rc == 3 then
+    return "device-missing", true
+  elseif rc == 4 then
+    return "permission-denied", true
+  elseif rc == 5 then
+    return "read-failed", false
+  elseif rc == 2 then
+    return "invalid-args", false
+  elseif rc == 1 then
+    return "write-failed", false
+  end
+  return "parse", false
+end
+
+-- 失败处理:致命进静默,其余走指数退避
+local function applyFailure(code, fatal)
+  health.error = code
+  if fatal then
+    health.silent = true
+    health.writable = false
+    probeAt = now() + SILENT_PROBE_MS
+  else
+    health.backoff_n = health.backoff_n + 1
+    local delay = math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * (2 ^ (health.backoff_n - 1)))
+    health.backoffUntil = now() + delay
+    health.writable = (code == "parse" or code == "invalid-args")
+  end
+end
+
+-- 进入卡死态:只标记,不发下一个,等回调真正回来
+local function enterStuck()
+  health.stuck = true
+  health.silent = false
+  health.error = "helper-stuck"
+  health.writable = false
+  probeAt = now() + SILENT_PROBE_MS
+end
+
+local function clearHealthy()
+  health.ok = true
+  health.error = ""
+  health.writable = true
+  health.backoff_n = 0
+  health.backoffUntil = 0
+  health.stuck = false
+  health.silent = false
+end
+
+-- 解析 status JSON,写 actual
+local function parseStatus(stdout)
+  local ok, decoded = pcall(noctalia.json.decode, stdout)
+  if not ok or type(decoded) ~= "table" then
+    return false, "parse"
+  end
+  actual.fan0 = tonumber(decoded.fan0) or -1
+  actual.fan1 = tonumber(decoded.fan1) or -1
+  actual.temp0 = tonumber(decoded.temp0) or -1
+  actual.temp1 = tonumber(decoded.temp1) or -1
+  actual.mode_reg = tonumber(decoded.mode) or 0
+  actual.minSpeed = tonumber(decoded.minSpeed) or 25
+  actual.lastReadAt = now()
+  if decoded.ok ~= true then
+    return false, "read-failed"
+  end
+  return true, ""
+end
+
+-- 前向声明
+local schedulerTick
+local engineRecomputeTarget
+local publish
+local savePersist
+
+-- 一次 Op 的结果处理(在 pcall 内运行)
+local function handleResult(op, result)
+  local nowMs = now()
+  if op.kind == "read" then
+    health.ok = false
+    if not result.spawnFailed and result.exitCode == 0 then
+      local ok, code = parseStatus(result.stdout or "")
+      if ok then
+        clearHealthy()
+        nextReadAt = nowMs + pollInterval()
+        engineRecomputeTarget()
+        publish()
+        return
+      end
+      applyFailure(code, false)
+      publish()
+      return
+    end
+    if result.timedOut then
+      enterStuck()
+    else
+      local code, fatal = classify(result)
+      applyFailure(code, fatal)
+    end
+    publish()
+    return
+  end
+
+  -- write / auto
+  if not result.spawnFailed and result.exitCode == 0 then
+    clearHealthy()
+    if op.kind == "write" then
+      appliedRaw = op.raw
+      appliedMode = "write"
+    else
+      appliedMode = MODE_AUTO
+    end
+    statusEarliestAt = nowMs + POST_WRITE_SETTLE_MS
+    nextReadAt = statusEarliestAt
+    publish()
+    return
+  end
+
+  if result.timedOut then
+    enterStuck()
+  else
+    local code, fatal = classify(result)
+    applyFailure(code, fatal)
+  end
+  publish()
+end
+
+-- Op 结束统一入口:先处理结果,再无条件复位 inFlight 并推进调度
+local function onOpDone(id, result)
+  local op = inFlight
+  if op and op.id == id then
+    pcall(handleResult, op, result)
+    pcall(function()
+      if inFlight and inFlight.id == id then
+        inFlight = nil
+      end
+    end)
+  end
+  pcall(schedulerTick)
+end
+
+-- 唯一 spawn helper 的地方
+local function startOp(kind, raw, timeout, isProbe)
+  local path = resolveHelperPath()
+  opSeq = opSeq + 1
+  local id = opSeq
+  if not path then
+    handleResult({ kind = kind, raw = raw }, { spawnFailed = true, exitCode = -1 })
+    return
+  end
+  inFlight = { id = id, kind = kind, raw = raw, startedAt = now(), probe = isProbe }
+  local argv = buildArgv(path, { kind = kind, raw = raw })
+  local started = noctalia.runAsync(argv, function(result)
+    pcall(onOpDone, id, result)
+  end, timeout)
+  if not started then
+    handleResult({ kind = kind, raw = raw }, { spawnFailed = true, exitCode = -1 })
+    if inFlight and inFlight.id == id then
+      inFlight = nil
+    end
+  end
+end
+
+-- 退出时交还 EC,fire-and-forget,短超时
+local function schedulerExitHandback()
+  local path = resolveHelperPath()
+  if not path then
+    health.error = "helper-missing"
+    return false
+  end
+  local ok = pcall(noctalia.runAsync, { path, "auto" }, nil, 2000)
+  return ok == true
+end
+
+-- 调度主循环:看门狗 -> 卡死/静默探测 -> 退避 -> auto -> 写 -> 读
+schedulerTick = function()
+  local nowMs = now()
+
+  -- 在途:只看看门狗,绝不另起一个
+  if inFlight then
+    local wd = WATCHDOG_MS[inFlight.kind] or 8000
+    if not health.stuck and (nowMs - inFlight.startedAt) > (wd + 2000) then
+      enterStuck()
+      publish()
+    end
+    return
+  end
+
+  -- 卡死态:只按慢节奏探测,不发任何写
+  if health.stuck then
+    if nowMs >= probeAt then
+      probeAt = nowMs + SILENT_PROBE_MS
+      startOp("read", nil, WATCHDOG_MS.read, true)
+    end
+    return
+  end
+
+  -- 静默态(致命错误):只做慢探,不写
+  if health.silent then
+    if nowMs >= probeAt then
+      probeAt = nowMs + SILENT_PROBE_MS
+      startOp("read", nil, WATCHDOG_MS.read, false)
+    end
+    return
+  end
+
+  -- 退避期:不重发同一次意图
+  if nowMs < health.backoffUntil then
+    return
+  end
+
+  -- auto 优先:desired 与已确认模式不一致才发一次
+  if desired.mode == MODE_AUTO then
+    pendingWrite = nil
+    writeDueAt = nil
+    if appliedMode ~= MODE_AUTO then
+      startOp("auto", nil, WATCHDOG_MS.auto, false)
+      return
+    end
+  else
+    -- 写:仅在目标与已确认值跨阈值且与上次意图不同时入队
+    local target = desired.targetRaw
+    if target and health.writable then
+      local need = (appliedRaw == nil) or math.abs(target - appliedRaw) >= RAW_STEP
+      if need then
+        pendingWrite = { raw = target }
+        if writeDueAt == nil then
+          writeDueAt = (nowMs <= userIntentUntil) and nowMs or (nowMs + WRITE_DEBOUNCE_MS)
+        end
+      end
+    end
+    if pendingWrite and nowMs >= (writeDueAt or 0) and (nowMs - lastWriteAt) >= EC_WRITE_MIN_INTERVAL_MS then
+      local raw = pendingWrite.raw
+      pendingWrite = nil
+      writeDueAt = nil
+      lastWriteAt = nowMs
+      startOp("write", raw, WATCHDOG_MS.write, false)
+      return
+    end
+  end
+
+  -- 读:按 poll 节奏,且避开刚写完的锁竞争窗口
+  if nowMs >= nextReadAt and nowMs >= statusEarliestAt then
+    startOp("read", nil, WATCHDOG_MS.read, false)
+  end
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- 5. MODE ENGINE (策略,纯改 desired)
+-- ══════════════════════════════════════════════════════════════════════════
+
+local curveTemp = nil -- 上次算曲线用的温度
+local safetyNotified = false -- 过热通知节流,温度回落后重置
+local sensorNotified = false -- 温度失效通知节流,温度恢复后重置
+
+local function notifySafe(title, body)
+  local ok = pcall(noctalia.notify, title, body)
+  if not ok then
+    pcall(noctalia.notifyError, title, body)
+    pcall(noctalia.log, tostring(title) .. " " .. tostring(body or ""))
+  end
+end
+
+local function curveName()
+  local name = desired.curve or cfg("curve") or "balanced"
+  if not CURVES[name] then
+    name = "balanced"
+  end
+  return name
+end
+
+-- 传感器温度;无效时返回非正值
 local function sensorTemp()
-  local t0 = tonumber(status.temp0) or -1
-  local t1 = tonumber(status.temp1) or -1
-  if cfg("sensor") == "max" then
+  local t0 = tonumber(actual.temp0) or -1
+  local t1 = tonumber(actual.temp1) or -1
+  if desired.sensor == "max" then
     if t0 <= 0 and t1 <= 0 then
       return -1
     end
@@ -184,21 +509,10 @@ local function sensorTemp()
   return t1
 end
 
-local function curveName()
-  local name = desiredCurve or cfg("curve") or "balanced"
-  if not CURVES[name] then
-    name = "balanced"
-  end
-  return name
-end
-
-local function curveRaw()
-  local name = curveName()
-  status.curve = name
-  local points = CURVES[name]
-  local temp = sensorTemp()
+-- 温度 -> raw 分段线性插值,叠加 min_fan_percent 下限
+local function curveRaw(temp)
+  local points = CURVES[curveName()]
   local raw
-
   if temp < points[1].temp then
     raw = points[1].raw
   elseif temp >= points[#points].temp then
@@ -214,7 +528,6 @@ local function curveRaw()
       end
     end
   end
-
   local floorPercent = tonumber(cfg("min_fan_percent")) or 0
   local floorRaw = math.floor(RAW_MAX * floorPercent / 100 + 0.5)
   if floorRaw > raw then
@@ -223,361 +536,298 @@ local function curveRaw()
   return math.max(0, math.min(RAW_MAX, raw))
 end
 
--- 计算曲线目标值;温度无效时返回 nil,请求交还 auto。
--- 用 auto 而非沿用旧值:传感器故障下曲线无法跟随温度,保持旧值可能既过热又过吵。
-local function curveTarget()
-  if not tempValid(sensorTemp()) then
-    return nil
-  end
-  return curveRaw()
-end
-
-local function publish()
-  status.ok = backendState == true
-  status.modeName = desiredMode
-  status.sensor = cfg("sensor") or "cpu"
-  status.safetyTempC = tonumber(cfg("safety_temp_c")) or 95
-  status.scale = RAW_MAX
-  status.curve = curveName()
-  noctalia.state.set(SNAPSHOT, {
-    ok = status.ok,
-    fan0 = status.fan0,
-    fan1 = status.fan1,
-    temp0 = status.temp0,
-    temp1 = status.temp1,
-    mode = status.mode,
-    minSpeed = status.minSpeed,
-    scale = status.scale,
-    modeName = status.modeName,
-    targetRaw = status.targetRaw,
-    appliedRaw = status.appliedRaw,
-    curve = status.curve,
-    sensor = status.sensor,
-    safetyTempC = status.safetyTempC,
-    error = errText(status.error),
-    live = isLive,
-  })
-  noctalia.state.set(LAST, {
-    live = isLive,
-    mode = desiredMode,
-    raw = desiredRaw,
-    curve = desiredCurve,
-  })
-end
-
--- 解析 status JSON;decode 失败或 ok 非 true 都视为不健康
-local function parseStatus(stdout)
-  local ok, decoded = pcall(noctalia.json.decode, stdout)
-  if not ok or type(decoded) ~= "table" or decoded.ok ~= true then
-    return false
-  end
-  status.fan0 = tonumber(decoded.fan0) or -1
-  status.fan1 = tonumber(decoded.fan1) or -1
-  status.temp0 = tonumber(decoded.temp0) or -1
-  status.temp1 = tonumber(decoded.temp1) or -1
-  status.mode = tonumber(decoded.mode) or 0
-  status.minSpeed = tonumber(decoded.minSpeed) or 25
-  return true
-end
-
--- 非 0 退出码 -> 后端状态与错误码;退出码区分设备缺失/权限/helper 缺失
-local function backendFromRc(rc)
-  if rc == 3 then
-    return false, "device-missing"
-  elseif rc == 4 then
-    return false, "permission-denied"
-  elseif rc == 5 then
-    return false, "read-failed"
-  elseif rc == 127 then
-    return false, "helper-missing"
-  end
-  return true, "parse"
-end
-
-local function refresh(onDone)
-  if reading then
-    if onDone then onDone() end
-    return
-  end
-  local quoted = helperQuoted()
-  if not quoted then
-    backendState = false
-    status.error = "helper-missing"
-    publish()
-    if onDone then onDone() end
-    return
-  end
-  reading = true
-  local ok = noctalia.runAsync(quoted .. " status", function(result)
-    -- 回调任一步出错也要复位 reading 并发布,否则刷新将永久停摆
-    pcall(function()
-      reading = false
-      local rc = result.exitCode
-      local healthy = rc == 0 and parseStatus(result.stdout or "")
-      if healthy then
-        backendState = true
-        status.error = ""
-      else
-        backendState, status.error = backendFromRc(rc)
-      end
-      publish()
-      if onDone then onDone() end
-    end)
-    reading = false
-  end, 3000)
-  if not ok then
-    reading = false
-    backendState = false
-    status.error = "helper-missing"
-    publish()
-    if onDone then onDone() end
-  end
-end
-
--- 交还 EC 自动控制。置位与写入结果无关:desiredMode 已由调用方置为 auto,
--- 保证交还失败时 tick 不会再把手动/曲线值写回去,避免与过热保护对打。
-local function sendAuto()
-  local quoted = helperQuoted()
-  if not quoted then
-    status.error = "helper-missing"
-    publish()
-    return
-  end
-  noctalia.runAsync(quoted .. " auto", function(result)
-    if result.exitCode == 0 then
-      status.targetRaw = 0
-    else
-      status.error = "write-failed"
-    end
-    publish()
-  end, 3000)
-end
-
--- 写两个风扇的目标占空比。左风扇在驱动修复后走共享曲线表,此处同步写入两条路径。
--- 写入进行中若有新目标,记为 pending,当前写完成后立即补写,避免快速拖动滑块丢值。
-local function applyRaw(raw)
-  if writing then
-    pendingRaw = raw
-    status.targetRaw = raw
-    return
-  end
-  local quoted = helperQuoted()
-  if not quoted then
-    status.error = "helper-missing"
-    publish()
-    return
-  end
-  writing = true
-  status.targetRaw = raw
-  local cmd = quoted .. " set 0 " .. tostring(raw) .. " && " .. quoted .. " set 1 " .. tostring(raw)
-  noctalia.runAsync(cmd, function(result)
-    -- 回调任一步出错也要复位 writing 并发布,否则后续写入请求全部被吞
-    pcall(function()
-      writing = false
-      if result.exitCode == 0 then
-        status.appliedRaw = raw
-      else
-        status.error = "write-failed"
-      end
-      publish()
-      if pendingRaw ~= nil then
-        local next = pendingRaw
-        pendingRaw = nil
-        applyRaw(next)
-      end
-    end)
-    writing = false
-  end, 3000)
-end
-
-local function applyDesired()
-  if desiredMode == MODE_AUTO then
-    sendAuto()
-  elseif desiredMode == MODE_MANUAL then
-    applyRaw(desiredRaw)
-  elseif desiredMode == MODE_CURVE then
-    local raw = curveTarget()
-    -- 曲线模式下但没有有效温度时交还 auto,而非写入低值。只改意向不动风扇
-    -- 已有档位,下一次 tick 由 auto 分支真正交还。
-    if raw == nil then
-      desiredMode = MODE_AUTO
-      desiredRaw = 0
-      publish()
-    else
-      applyRaw(raw)
-    end
-  end
-end
-
-local function safetyCheck()
-  local safety = tonumber(cfg("safety_temp_c")) or 95
-  local temp = sensorTemp()
-  if not tempValid(temp) then
-    -- 温度不可用:不写曲线/手动低值,交还 auto 保底,警告只发一次
-    if desiredMode ~= MODE_AUTO then
-      if not sensorWarned then
-        sensorWarned = true
-        noctalia.notify(noctalia.tr("notify.sensor.title"), noctalia.tr("notify.sensor.body"))
-      end
-      desiredMode = MODE_AUTO
-      desiredRaw = 0
-      isLive = false
-      publish()
-    end
-    return
-  end
-  sensorWarned = false
-  if desiredMode ~= MODE_AUTO and temp >= safety then
-    -- 立即乐观置位 auto,否则交还失败时下一 tick 会再次触发
-    if not safetyNotified then
-      safetyNotified = true
-      noctalia.notify(
-        noctalia.tr("notify.safety.title"),
-        noctalia.tr("notify.safety.body", { temp = tostring(temp) })
-      )
-    end
-    desiredMode = MODE_AUTO
-    desiredRaw = 0
-    isLive = false
-    publish()
-    sendAuto()
-  elseif temp < safety - 5 then
-    safetyNotified = false
-  end
-end
-
--- 手动模式初值:优先沿用有效历史值,否则用当前实测占空比,读不到再取中档。
--- 面板直接切手动时不会因 desiredRaw 为 0 把风扇打到停转。
+-- 手动档初值:历史值 -> 当前实测 -> 中档
 local function manualSeedRaw()
-  if desiredRaw > 0 then
-    return desiredRaw
+  if desired.raw and desired.raw > 0 then
+    return desired.raw
   end
-  local measured = math.max(tonumber(status.fan0) or -1, tonumber(status.fan1) or -1)
+  local measured = math.max(tonumber(actual.fan0) or -1, tonumber(actual.fan1) or -1)
   if measured > 0 then
     return math.min(RAW_MAX, measured)
   end
   return math.floor(RAW_MAX / 2)
 end
 
-local function setMode(mode, raw)
-  if mode == MODE_AUTO then
-    isLive = false
-    desiredMode = MODE_AUTO
-    publish()
-    sendAuto()
-  elseif mode == MODE_MANUAL then
-    isLive = true
-    desiredMode = MODE_MANUAL
-    if raw then
-      desiredRaw = math.max(0, math.min(RAW_MAX, tonumber(raw) or desiredRaw))
-    else
-      desiredRaw = manualSeedRaw()
+-- 重算当前模式的生效目标(写 desired.targetRaw,不发 EC 写)
+engineRecomputeTarget = function()
+  if desired.mode == MODE_MANUAL then
+    desired.targetRaw = normalizeRaw(desired.raw)
+  elseif desired.mode == MODE_CURVE then
+    local temp = sensorTemp()
+    if tempValid(temp) and (curveTemp == nil or math.abs(temp - curveTemp) >= TEMP_REAPPLY_DELTA_C) then
+      curveTemp = temp
+      desired.targetRaw = normalizeRaw(curveRaw(temp))
     end
-    publish()
-    applyRaw(desiredRaw)
+  else
+    desired.targetRaw = nil
+  end
+end
+
+-- 曲线模式下温度失效或过热时乐观交还 auto;manual 不强制交还
+local function engineSafety()
+  local safety = desired.safety_c
+  local temp = sensorTemp()
+
+  if not tempValid(temp) then
+    -- 温度通道失效:curve 交还 auto;manual 保持(用户显式设定),仅告警
+    if desired.mode == MODE_CURVE then
+      if not sensorNotified then
+        sensorNotified = true
+        notifySafe(noctalia.tr("notify.sensor.title"), noctalia.tr("notify.sensor.body"))
+      end
+      desired.mode = MODE_AUTO
+      desired.targetRaw = nil
+      curveTemp = nil
+      savePersist()
+    end
+    return
+  end
+
+  sensorNotified = false
+  if desired.mode ~= MODE_AUTO and temp >= safety then
+    if not safetyNotified then
+      safetyNotified = true
+      notifySafe(
+        noctalia.tr("notify.safety.title"),
+        noctalia.tr("notify.safety.body", { temp = tostring(temp) })
+      )
+    end
+    desired.mode = MODE_AUTO
+    desired.targetRaw = nil
+    curveTemp = nil
+    savePersist()
+  elseif temp < safety - 5 then
+    safetyNotified = false
+  end
+end
+
+local function engineEnterMode(mode, raw)
+  if mode == MODE_AUTO then
+    desired.mode = MODE_AUTO
+    desired.targetRaw = nil
+    curveTemp = nil
+  elseif mode == MODE_MANUAL then
+    desired.mode = MODE_MANUAL
+    if raw ~= nil then
+      local v = math.floor((tonumber(raw) or 0) + 0.5)
+      desired.raw = math.max(0, math.min(RAW_MAX, v))
+    else
+      desired.raw = manualSeedRaw()
+    end
+    desired.targetRaw = normalizeRaw(desired.raw)
+    schedulerMarkUserIntent()
   elseif mode == MODE_CURVE then
     if not tempValid(sensorTemp()) then
-      -- 温度无效时曲线无法计算,直接交还 auto,避免写入最低档
-      setMode(MODE_AUTO)
+      engineEnterMode(MODE_AUTO)
       return
     end
-    isLive = true
-    desiredMode = MODE_CURVE
-    publish()
-    applyRaw(curveTarget())
+    desired.mode = MODE_CURVE
+    curveTemp = nil
+    desired.targetRaw = normalizeRaw(curveRaw(sensorTemp()))
   end
+  savePersist()
+  publish()
 end
 
-local function cycleMode()
-  if desiredMode == MODE_AUTO then
-    setMode(MODE_CURVE)
-  elseif desiredMode == MODE_CURVE then
-    setMode(MODE_MANUAL)
+local function engineSetCurve(name)
+  desired.curve = name
+  curveTemp = nil
+  schedulerMarkUserIntent()
+  if desired.mode == MODE_CURVE then
+    engineRecomputeTarget()
+  end
+  savePersist()
+  publish()
+end
+
+local function engineCycle()
+  if desired.mode == MODE_AUTO then
+    engineEnterMode(MODE_CURVE)
+  elseif desired.mode == MODE_CURVE then
+    engineEnterMode(MODE_MANUAL)
   else
-    setMode(MODE_AUTO)
+    engineEnterMode(MODE_AUTO)
   end
 end
 
-local function handleCommand(cmd)
-  if type(cmd) == "table" then
-    if cmd.action == "set_mode" and type(cmd.mode) == "string" then
-      setMode(cmd.mode, cmd.raw)
-    elseif cmd.action == "set_raw" then
-      isLive = true
-      desiredMode = MODE_MANUAL
-      desiredRaw = math.max(0, math.min(RAW_MAX, tonumber(cmd.raw) or 0))
-      applyRaw(desiredRaw)
-    elseif cmd.action == "set_curve" and type(cmd.name) == "string" then
-      if CURVES[cmd.name] then
-        desiredCurve = cmd.name
-        if desiredMode == MODE_CURVE then
-          local raw = curveTarget()
-          if raw == nil then
-            setMode(MODE_AUTO)
-          else
-            applyRaw(raw)
-          end
-        else
-          publish()
-        end
-      end
-    elseif cmd.action == "cycle_mode" then
-      cycleMode()
-    elseif cmd.action == "refresh" then
-      refresh()
+-- 命令分发(只接受 table 形式)
+local function engineHandleCommand(cmd)
+  if type(cmd) ~= "table" then
+    return
+  end
+  if cmd.action == "set_mode" and type(cmd.mode) == "string" then
+    engineEnterMode(cmd.mode, cmd.raw)
+  elseif cmd.action == "set_raw" then
+    local v = math.max(0, math.min(RAW_MAX, tonumber(cmd.raw) or 0))
+    engineEnterMode(MODE_MANUAL, v)
+  elseif cmd.action == "set_curve" and type(cmd.name) == "string" then
+    if CURVES[cmd.name] then
+      engineSetCurve(cmd.name)
     end
-  elseif cmd == "cycle_mode" then
-    cycleMode()
-  elseif cmd == "refresh" then
-    refresh()
+  elseif cmd.action == "cycle_mode" then
+    engineCycle()
+  elseif cmd.action == "refresh" then
+    schedulerRequestRead()
   end
 end
 
-noctalia.state.watch(COMMAND, handleCommand)
+-- ══════════════════════════════════════════════════════════════════════════
+-- 6. PUBLISH / UI BRIDGE
+-- ══════════════════════════════════════════════════════════════════════════
 
-local function tick()
-  refresh(function()
-    if desiredMode ~= MODE_AUTO then
-      safetyCheck()
-      if desiredMode ~= MODE_AUTO then
-        applyDesired()
-      end
-    end
-  end)
+local lastSig = nil
+
+-- 组装并发布快照;签名未变则跳过
+publish = function()
+  local outRaw
+  if desired.mode == MODE_MANUAL then
+    outRaw = desired.raw -- 展示用户值,归一化只发生在传输层
+  else
+    outRaw = desired.targetRaw or 0
+  end
+  local snapshot = {
+    ok = health.ok,
+    fan0 = actual.fan0,
+    fan1 = actual.fan1,
+    temp0 = actual.temp0,
+    temp1 = actual.temp1,
+    mode = actual.mode_reg,
+    minSpeed = actual.minSpeed,
+    scale = RAW_MAX,
+    modeName = desired.mode,
+    targetRaw = outRaw,
+    appliedRaw = appliedRaw or 0,
+    curve = curveName(),
+    sensor = desired.sensor,
+    safetyTempC = desired.safety_c,
+    error = errText(health.error),
+    live = desired.mode ~= MODE_AUTO,
+    writable = health.writable,
+  }
+  local sig = table.concat({
+    tostring(snapshot.ok),
+    tostring(snapshot.fan0),
+    tostring(snapshot.fan1),
+    tostring(snapshot.temp0),
+    tostring(snapshot.temp1),
+    tostring(snapshot.mode),
+    tostring(snapshot.modeName),
+    tostring(snapshot.targetRaw),
+    tostring(snapshot.appliedRaw),
+    tostring(snapshot.curve),
+    tostring(snapshot.sensor),
+    tostring(snapshot.safetyTempC),
+    tostring(snapshot.error),
+    tostring(snapshot.live),
+    tostring(snapshot.writable),
+  }, "|")
+  if sig == lastSig then
+    return
+  end
+  lastSig = sig
+  pcall(noctalia.state.set, SNAPSHOT, snapshot)
+end
+
+-- ══════════════════════════════════════════════════════════════════════════
+-- 7. LIFECYCLE
+-- ══════════════════════════════════════════════════════════════════════════
+
+local function stateFilePath()
+  local dir = noctalia.pluginDataDir()
+  if type(dir) ~= "string" or dir == "" then
+    return nil
+  end
+  return dir .. "/state.json"
+end
+
+-- 读取持久化意图;缺失或损坏回退默认
+local function loadPersist()
+  local path = stateFilePath()
+  if not path then
+    return {}
+  end
+  local ok, contents = pcall(noctalia.readFile, path)
+  if not ok or type(contents) ~= "string" or contents == "" then
+    return {}
+  end
+  local ok2, decoded = pcall(noctalia.json.decode, contents)
+  if not ok2 or type(decoded) ~= "table" then
+    return {}
+  end
+  return decoded
+end
+
+-- 写持久化意图(模式/曲线/手动值)
+savePersist = function()
+  local path = stateFilePath()
+  if not path then
+    return
+  end
+  local ok, encoded = pcall(noctalia.json.encode, {
+    mode = desired.mode,
+    raw = desired.raw,
+    curve = desired.curve,
+  }, true)
+  if not ok or type(encoded) ~= "string" then
+    return
+  end
+  pcall(noctalia.writeFile, path, encoded)
 end
 
 function update()
-  tick()
+  engineSafety()
+  engineRecomputeTarget()
+  schedulerTick()
+  publish()
 end
 
 function onConfigChanged()
-  noctalia.setUpdateInterval(tonumber(cfg("poll_interval_ms")) or TICK_MS)
-  refresh()
+  desired.sensor = cfg("sensor") or "cpu"
+  desired.safety_c = tonumber(cfg("safety_temp_c")) or 95
+  noctalia.setUpdateInterval(SCHED_TICK_MS)
+  publish()
 end
 
 function onEnable()
-  refresh()
+  local saved = loadPersist()
+  desired.sensor = cfg("sensor") or "cpu"
+  desired.safety_c = tonumber(cfg("safety_temp_c")) or 95
+  if type(saved.curve) == "string" and CURVES[saved.curve] then
+    desired.curve = saved.curve
+  end
+  if tonumber(saved.raw) then
+    desired.raw = math.max(0, math.min(RAW_MAX, math.floor(tonumber(saved.raw) + 0.5)))
+  end
+  -- 启动默认 auto,不夺权
+  desired.mode = MODE_AUTO
+  desired.targetRaw = nil
+  appliedMode = MODE_AUTO
+  noctalia.setUpdateInterval(SCHED_TICK_MS)
+  publish()
+  schedulerRequestRead()
+  schedulerTick()
 end
 
 function onExit(_signal, reason)
-  -- 插件停用或外壳退出时交还 EC 控制,并把持久化模式重置为 auto,
-  -- 避免下次启动时突然夺回风扇(期间 EC 可能已经按自己的曲线调整过)
-  if desiredMode ~= MODE_AUTO and reason ~= "reload" then
-    desiredMode = MODE_AUTO
-    isLive = false
-    -- 配置的 helper 非法时退回默认路径再交还;退回或两者皆废都记一笔
-    local quoted, fallback = resolveHelperQuoted()
-    if fallback or not quoted then
-      status.error = "helper-missing"
+  -- 重载不交还,免得热重载抢走 EC 控制
+  if reason == "reload" then
+    return
+  end
+  if desired.mode ~= MODE_AUTO or appliedMode ~= MODE_AUTO then
+    desired.mode = MODE_AUTO
+    desired.targetRaw = nil
+    savePersist()
+    local ok = schedulerExitHandback()
+    if not ok then
+      health.error = "helper-missing"
     end
     publish()
-    if quoted then
-      noctalia.runAsync(quoted .. " auto", nil, 2000)
-    end
+    pcall(noctalia.log, "[mechrevo-fan] onExit handback, helper ok=" .. tostring(ok))
   end
 end
 
-noctalia.setUpdateInterval(tonumber(cfg("poll_interval_ms")) or TICK_MS)
+noctalia.state.watch(COMMAND, function(cmd)
+  pcall(engineHandleCommand, cmd)
+end)
 
-publish()
-refresh()
+onEnable()

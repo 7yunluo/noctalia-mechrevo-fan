@@ -15,6 +15,7 @@ local snap = noctalia.state.get(SNAPSHOT) or {
   sensor = "cpu",
   live = false,
   error = "",
+  writable = true,
 }
 
 local MODE_AUTO = "auto"
@@ -28,6 +29,11 @@ local render -- 前向声明:各控件的回调在 render 定义前引用它
 
 local function send(payload)
   noctalia.state.set(COMMAND, payload)
+end
+
+-- helper 可用且后端可写时才放行控件
+local function controlsEnabled()
+  return snap.ok == true and snap.writable ~= false
 end
 
 local function dutyPercent(raw)
@@ -51,7 +57,7 @@ local function modeButton(mode)
     text = modeLabel(mode),
     variant = active and "primary" or "outline",
     flexGrow = 1,
-    enabled = snap.ok == true,
+    enabled = controlsEnabled(),
     onClick = function()
       sliderPreview = nil
       send({ action = "set_mode", mode = mode })
@@ -66,7 +72,7 @@ local function curveButton(name)
     text = noctalia.tr("curve." .. name),
     variant = active and "primary" or "ghost",
     flexGrow = 1,
-    enabled = (snap.modeName or MODE_AUTO) == MODE_CURVE,
+    enabled = controlsEnabled() and (snap.modeName or MODE_AUTO) == MODE_CURVE,
     onClick = function()
       send({ action = "set_curve", name = name })
     end,
@@ -104,6 +110,13 @@ local function statusSection()
       fontSize = 10,
       color = "on_surface_variant",
     }) or ui.box({}),
+    -- helper 卡住或不可写时的只读状态行
+    (snap.writable == false) and ui.label({
+      text = tostring(snap.error or ""),
+      fontSize = 10,
+      color = "error",
+      maxLines = 2,
+    }) or ui.box({}),
   })
 end
 
@@ -113,7 +126,7 @@ local function manualSection()
   if shown == nil then
     shown = tonumber(snap.targetRaw) or 0
   end
-  local enabled = (snap.modeName or MODE_AUTO) == MODE_MANUAL and snap.ok == true
+  local enabled = (snap.modeName or MODE_AUTO) == MODE_MANUAL and controlsEnabled()
   return ui.column({ key = "manual", gap = 6 }, {
     ui.row({ align = "center", justify = "space_between" }, {
       ui.label({ text = noctalia.tr("panel.manual_speed"), fontSize = 11, fontWeight = "bold", color = "on_surface_variant" }),

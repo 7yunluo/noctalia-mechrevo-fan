@@ -32,7 +32,9 @@
     "helper-missing": "找不到 helper",
     "read-failed": "读取状态失败",
     "parse": "无法解析 helper 输出",
-    "write-failed": "设置风扇转速失败"
+    "write-failed": "设置风扇转速失败",
+    "invalid-args": "helper 拒绝了参数",
+    "helper-stuck": "helper 无响应,等待其自行返回"
   },
   "curve": {
     "quiet": "安静",
