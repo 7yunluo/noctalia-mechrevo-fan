@@ -4,10 +4,12 @@
 用法: apply-driver-patch.py [uniwill_keyboard.h 路径]
 不传路径时自动探测 /usr/src/mechrevo-drivers-*/uniwill_keyboard.h。
 
-五处改动：新增静态标志 uw_fan_shared_table、uw_init_fan() 只在首次初始化时做
+七处改动：新增静态标志 uw_fan_shared_table、uw_init_fan() 只在首次初始化时做
 DMI 判定、uw_init_fan() 重复进入时提前返回、uw_set_fan() 的 fan_index==1 分支
 在共享表时改写 CPU 表地址、把 WUJIE 机型加进 has_universal_ec_fan_control()
-的例外表，让 uw_set_fan 走锁存手动风扇值的 old fan control。
+的例外表，让 uw_set_fan 走锁存手动风扇值的 old fan control；另外两条交还可靠性
+修复：uw_set_fan_auto() 的 old 分支改用带重试回读的写入（autorc）、
+uniwill_keyboard_remove() 卸载时调一次 uw_set_fan_auto() 交还 EC（remove）。
 每条改动独立判断：已落位的跳过，未落位的用锚点精确匹配，匹配不唯一或缺失即报错
 退出；全部已落位则直接成功退出。
 先写临时文件再 os.replace，并保留一次 .orig 备份。
@@ -107,6 +109,23 @@ EDITS = [
         "\t\t|| dmi_match(DMI_BOARD_NAME, \"X5AR45xS\")\n"
         "\t\t|| dmi_match(DMI_BOARD_NAME, \"WUJIE Series-X5SP4NAG\")\n"
         "\t;",
+    ),
+    (
+        "autorc",
+        "\t\tuniwill_write_ec_ram(0x0751, mode_data & 0xbf);\n",
+        "\t\tuniwill_write_ec_ram_with_retry(0x0751, mode_data & 0xbf, 3);\n",
+    ),
+    (
+        "remove",
+        "\tcancel_delayed_work_sync(&direct_fan_control_restart_delayed_work);\n"
+        "\n"
+        "#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)\n",
+        "\tcancel_delayed_work_sync(&direct_fan_control_restart_delayed_work);\n"
+        "\n"
+        "\t// Hand EC back to automatic fan control on unload\n"
+        "\tuw_set_fan_auto();\n"
+        "\n"
+        "#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)\n",
     ),
 ]
 
