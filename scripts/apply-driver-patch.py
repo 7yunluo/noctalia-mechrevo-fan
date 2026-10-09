@@ -4,10 +4,12 @@
 用法: apply-driver-patch.py [uniwill_keyboard.h 路径]
 不传路径时自动探测 /usr/src/mechrevo-drivers-*/uniwill_keyboard.h。
 
-四处改动：新增静态标志 uw_fan_shared_table、uw_init_fan() 只在首次初始化时做
+五处改动：新增静态标志 uw_fan_shared_table、uw_init_fan() 只在首次初始化时做
 DMI 判定、uw_init_fan() 重复进入时提前返回、uw_set_fan() 的 fan_index==1 分支
-在共享表时改写 CPU 表地址。
-锚点精确匹配，匹配不唯一或缺失即报错退出；已打过补丁则直接成功退出。
+在共享表时改写 CPU 表地址、把 WUJIE 机型加进 has_universal_ec_fan_control()
+的例外表，让 uw_set_fan 走锁存手动风扇值的 old fan control。
+每条改动独立判断：已落位的跳过，未落位的用锚点精确匹配，匹配不唯一或缺失即报错
+退出；全部已落位则直接成功退出。
 先写临时文件再 os.replace，并保留一次 .orig 备份。
 """
 
@@ -92,6 +94,20 @@ EDITS = [
         "\t\t\telse\n"
         "\t\t\t\treturn -EINVAL;",
     ),
+    (
+        "oldctl",
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"GXxMRXx\")\n"
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"XxAR4NAx\")\n"
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"X6FR5xxY\")\n"
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"X5AR45xS\")\n"
+        "\t;",
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"GXxMRXx\")\n"
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"XxAR4NAx\")\n"
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"X6FR5xxY\")\n"
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"X5AR45xS\")\n"
+        "\t\t|| dmi_match(DMI_BOARD_NAME, \"WUJIE Series-X5SP4NAG\")\n"
+        "\t;",
+    ),
 ]
 
 
@@ -124,21 +140,20 @@ def main():
         original = f.read()
     text = original
 
-    if "uw_fan_shared_table" in text:
-        missing = [name for name, _, new in EDITS if new not in text]
-        if missing:
-            sys.exit("ERROR: uw_fan_shared_table present but hunks missing: %s" % missing)
-        print("already patched, nothing to do (idempotent)")
-        return 0
-
-    for name, old, _ in EDITS:
+    applied = []
+    for name, old, new in EDITS:
+        if new in text:
+            continue
         n = text.count(old)
         if n != 1:
             sys.exit("ERROR: anchor %r matched %d times (expected exactly 1)" % (name, n))
-
-    for name, old, new in EDITS:
         text = text.replace(old, new, 1)
+        applied.append(name)
         print("applied hunk: %s" % name)
+
+    if not applied:
+        print("already patched, nothing to do (idempotent)")
+        return 0
 
     backup_once(target, original)
     write_atomic(target, text)
