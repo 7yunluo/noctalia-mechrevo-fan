@@ -170,16 +170,15 @@ local function tempValid(temp)
   return temp ~= nil and temp == temp and temp > 0
 end
 
--- 组装 argv(API 24,无 shell)
+-- 按 Op 类型组成完整 argv(API 24,直接 exec 无 shell)
 local function buildArgv(path, op)
   if op.kind == "read" then
     return { path, "status" }
   elseif op.kind == "auto" then
     return { path, "auto" }
   end
-  -- 写两个风扇占空比
-  local raw = tostring(op.raw)
-  return { path, "set", "0", raw, "&&", path, "set", "1", raw }
+  -- helper 的 set 一次只写一个风扇,左右两路由调度器串行成对下发
+  return { path, "set", tostring(op.fan or 0), tostring(op.raw) }
 end
 
 -- ══════════════════════════════════════════════════════════════════════════
@@ -188,9 +187,11 @@ end
 
 local inFlight = nil -- { id, kind, raw, startedAt, probe }
 local opSeq = 0
-local pendingWrite = nil -- { raw }
+local pendingWrite = nil -- { raw }: 下一轮写入的目标
 local writeDueAt = nil
-local lastWriteAt = 0
+local writeStage = nil -- nil=空闲 / "fan0"=右路已发 / "fan1"=左路已发
+local writeRoundRaw = nil -- 当前一轮写入的冻结目标,保证左右两路同值
+local lastWriteAt = 0 -- 上一轮(左右两路)完成时刻
 local appliedRaw = nil -- EC 已确认的占空比
 local appliedMode = MODE_AUTO -- EC 已确认的控制模式
 local statusEarliestAt = 0
@@ -325,21 +326,44 @@ local function handleResult(op, result)
     return
   end
 
-  -- write / auto
+  -- write(单风扇);左右两路成对下发,以左路(fan1)完成作为整轮写入完成
+  if op.kind == "write" then
+    if not result.spawnFailed and result.exitCode == 0 then
+      clearHealthy()
+      appliedMode = "write"
+      if op.fan == 1 then
+        appliedRaw = op.raw
+        writeStage = nil
+        writeRoundRaw = nil
+        lastWriteAt = nowMs
+        statusEarliestAt = nowMs + POST_WRITE_SETTLE_MS
+        nextReadAt = statusEarliestAt
+      end
+      publish()
+      return
+    end
+    -- 任一路失败都放弃本轮,免得只写到一半
+    writeStage = nil
+    writeRoundRaw = nil
+    if result.timedOut then
+      enterStuck()
+    else
+      local code, fatal = classify(result)
+      applyFailure(code, fatal)
+    end
+    publish()
+    return
+  end
+
+  -- auto
   if not result.spawnFailed and result.exitCode == 0 then
     clearHealthy()
-    if op.kind == "write" then
-      appliedRaw = op.raw
-      appliedMode = "write"
-    else
-      appliedMode = MODE_AUTO
-    end
+    appliedMode = MODE_AUTO
     statusEarliestAt = nowMs + POST_WRITE_SETTLE_MS
     nextReadAt = statusEarliestAt
     publish()
     return
   end
-
   if result.timedOut then
     enterStuck()
   else
@@ -364,21 +388,21 @@ local function onOpDone(id, result)
 end
 
 -- 唯一 spawn helper 的地方
-local function startOp(kind, raw, timeout, isProbe)
+local function startOp(kind, raw, timeout, isProbe, fan)
   local path = resolveHelperPath()
   opSeq = opSeq + 1
   local id = opSeq
   if not path then
-    handleResult({ kind = kind, raw = raw }, { spawnFailed = true, exitCode = -1 })
+    handleResult({ kind = kind, raw = raw, fan = fan }, { spawnFailed = true, exitCode = -1 })
     return
   end
-  inFlight = { id = id, kind = kind, raw = raw, startedAt = now(), probe = isProbe }
-  local argv = buildArgv(path, { kind = kind, raw = raw })
+  inFlight = { id = id, kind = kind, raw = raw, fan = fan, startedAt = now(), probe = isProbe }
+  local argv = buildArgv(path, { kind = kind, raw = raw, fan = fan })
   local started = noctalia.runAsync(argv, function(result)
     pcall(onOpDone, id, result)
   end, timeout)
   if not started then
-    handleResult({ kind = kind, raw = raw }, { spawnFailed = true, exitCode = -1 })
+    handleResult({ kind = kind, raw = raw, fan = fan }, { spawnFailed = true, exitCode = -1 })
     if inFlight and inFlight.id == id then
       inFlight = nil
     end
@@ -433,33 +457,50 @@ schedulerTick = function()
     return
   end
 
-  -- auto 优先:desired 与已确认模式不一致才发一次
+  -- 写:先把待写目标入队(去抖合并),再按「轮」下发左右两路
   if desired.mode == MODE_AUTO then
     pendingWrite = nil
     writeDueAt = nil
+    -- 放弃未完成的写轮次:auto 应接管,不再补写另一路
+    writeStage = nil
+    writeRoundRaw = nil
     if appliedMode ~= MODE_AUTO then
       startOp("auto", nil, WATCHDOG_MS.auto, false)
       return
     end
   else
-    -- 写:仅在目标与已确认值跨阈值且与上次意图不同时入队
     local target = desired.targetRaw
-    if target and health.writable then
-      local need = (appliedRaw == nil) or math.abs(target - appliedRaw) >= RAW_STEP
-      if need then
-        pendingWrite = { raw = target }
-        if writeDueAt == nil then
-          writeDueAt = (nowMs <= userIntentUntil) and nowMs or (nowMs + WRITE_DEBOUNCE_MS)
-        end
+    local need = target and health.writable
+      and ((appliedRaw == nil) or math.abs(target - appliedRaw) >= RAW_STEP)
+    if need then
+      pendingWrite = { raw = target }
+      if writeDueAt == nil then
+        writeDueAt = (nowMs <= userIntentUntil) and nowMs or (nowMs + WRITE_DEBOUNCE_MS)
       end
-    end
-    if pendingWrite and nowMs >= (writeDueAt or 0) and (nowMs - lastWriteAt) >= EC_WRITE_MIN_INTERVAL_MS then
-      local raw = pendingWrite.raw
+    else
+      -- 已追平或不可写:清掉待写,避免重复下发同值
       pendingWrite = nil
       writeDueAt = nil
-      lastWriteAt = nowMs
-      startOp("write", raw, WATCHDOG_MS.write, false)
+    end
+
+    -- 第二轮:补齐另一路风扇
+    if writeStage ~= nil then
+      local fan = (writeStage == "fan0") and 1 or 0
+      startOp("write", writeRoundRaw, WATCHDOG_MS.write, false, fan)
       return
+    end
+
+    -- 第一轮:冻结当前目标,先写右路
+    if pendingWrite and nowMs >= (writeDueAt or 0) then
+      if nowMs - lastWriteAt >= EC_WRITE_MIN_INTERVAL_MS then
+        writeRoundRaw = pendingWrite.raw
+        pendingWrite = nil
+        writeDueAt = nil
+        lastWriteAt = nowMs
+        writeStage = "fan0"
+        startOp("write", writeRoundRaw, WATCHDOG_MS.write, false, 0)
+        return
+      end
     end
   end
 
