@@ -305,8 +305,8 @@ local function handleResult(op, result)
 
   if op.kind == "read" then
     if not result.spawnFailed and result.exitCode == 0 then
-      local ok, code = parseStatus(result.stdout or "")
-      if ok then
+      local parsed, code = parseStatus(result.stdout or "")
+      if parsed then
         clearHealthy()
         nextReadAt = nowMs + pollInterval()
         engineRecomputeTarget()
