@@ -40,13 +40,7 @@ local function displayText()
   if not snap.ok then
     return "--"
   end
-  -- 以右风扇(fan0)直写值为主显示;左风扇状态放工具提示
-  local f0 = tonumber(snap.fan0) or -1
-  local f1 = tonumber(snap.fan1) or -1
-  local mainRaw = f0
-  if mainRaw < 0 then
-    mainRaw = f1
-  end
+  local mainRaw = displayFan()
   local temp = math.max(tonumber(snap.temp0) or -1, tonumber(snap.temp1) or -1)
   local duty = dutyPercent(mainRaw)
   if temp > 0 then
@@ -72,7 +66,8 @@ local function tooltipRows()
     { key = noctalia.tr("widget.tooltip.fan_right"), value = tostring(dutyPercent(f0)) .. "%" },
     {
       key = noctalia.tr("widget.tooltip.fan_left"),
-      value = (f1 > 1) and (tostring(dutyPercent(f1)) .. "%") or noctalia.tr("widget.left_unavailable"),
+      -- f1 < 0 才是读取失败;能读到数值就显示占空比(低速/停转时显示 0%)
+      value = (f1 >= 0) and (tostring(dutyPercent(f1)) .. "%") or noctalia.tr("widget.left_unavailable"),
     },
     { key = noctalia.tr("widget.tooltip.mode"), value = modeLabel() .. (snap.live and " *" or "") },
   }
