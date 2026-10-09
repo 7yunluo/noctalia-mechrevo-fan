@@ -256,6 +256,7 @@ end
 
 -- 进入卡死态:只标记,不发下一个,等回调真正回来
 local function enterStuck()
+  health.ok = false
   health.stuck = true
   health.silent = false
   health.error = "helper-stuck"
@@ -301,8 +302,8 @@ local savePersist
 -- 一次 Op 的结果处理(在 pcall 内运行)
 local function handleResult(op, result)
   local nowMs = now()
+
   if op.kind == "read" then
-    health.ok = false
     if not result.spawnFailed and result.exitCode == 0 then
       local ok, code = parseStatus(result.stdout or "")
       if ok then
@@ -312,10 +313,13 @@ local function handleResult(op, result)
         publish()
         return
       end
+      -- 能跑通但 ok=false:标记不可用并退避重读,不误判为卡死
+      health.ok = false
       applyFailure(code, false)
       publish()
       return
     end
+    health.ok = false
     if result.timedOut then
       enterStuck()
     else
@@ -609,7 +613,8 @@ local function engineSafety()
   local safety = desired.safety_c
   local temp = sensorTemp()
 
-  if not tempValid(temp) then
+  -- 尚未成功读过之前不知道温度,不做无效判定,免得启动即误交还
+  if actual.lastReadAt > 0 and not tempValid(temp) then
     -- 温度通道失效:curve 交还 auto;manual 保持(用户显式设定),仅告警
     if desired.mode == MODE_CURVE then
       if not sensorNotified then
