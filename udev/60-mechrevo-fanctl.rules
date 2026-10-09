@@ -1,0 +1,2 @@
+# 让 plugdev 组可以读写 tuxedo_io,供 mechrevo-fanctl / Noctalia 插件免 root 使用。
+SUBSYSTEM=="tuxedo_io", KERNEL=="tuxedo_io", MODE="0660", GROUP="plugdev"

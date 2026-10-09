@@ -1,0 +1,75 @@
+{
+  "panel": {
+    "title": "机械革命风扇",
+    "status": "硬件状态",
+    "mode": "控制模式",
+    "curve": "温度曲线",
+    "manual_speed": "手动转速",
+    "manual_hint": "低于 25% 的转速会被 EC 夹取到最低档,属于硬件行为",
+    "fan_left": "左风扇",
+    "fan_right": "右风扇",
+    "temp": "温度",
+    "live_hint": "手动/曲线模式生效中,点击「自动」交还 EC 控制"
+  },
+  "widget": {
+    "mode": {
+      "auto": "自动",
+      "curve": "曲线",
+      "manual": "手动"
+    },
+    "tooltip": {
+      "fan_left": "左风扇",
+      "fan_right": "右风扇",
+      "mode": "模式",
+      "temp": "温度",
+      "error": "错误"
+    },
+    "left_unavailable": "不可用(驱动未打补丁)"
+  },
+  "curve": {
+    "quiet": "安静",
+    "balanced": "均衡",
+    "performance": "性能"
+  },
+  "settings": {
+    "poll_interval_ms": {
+      "label": "轮询间隔(毫秒)",
+      "description": "读取风扇状态的间隔"
+    },
+    "sensor": {
+      "label": "温度传感器",
+      "description": "曲线依据哪个温度",
+      "options": {
+        "cpu": "CPU 温度",
+        "max": "两者取高"
+      }
+    },
+    "curve": {
+      "label": "默认曲线",
+      "description": "曲线模式的默认温度-转速表",
+      "options": {
+        "quiet": "安静",
+        "balanced": "均衡",
+        "performance": "性能"
+      }
+    },
+    "min_fan_percent": {
+      "label": "最低转速下限(%)",
+      "description": "曲线模式下的转速下限,0 表示允许停转"
+    },
+    "safety_temp_c": {
+      "label": "保护温度(°C)",
+      "description": "达到此温度立即交还 EC 自动控制"
+    },
+    "helper_path": {
+      "label": "helper 路径",
+      "description": "mechrevo-fanctl 可执行文件路径"
+    }
+  },
+  "notify": {
+    "safety": {
+      "title": "风扇过热保护",
+      "body": "温度达到 {temp}°C,已交还 EC 自动控制"
+    }
+  }
+}

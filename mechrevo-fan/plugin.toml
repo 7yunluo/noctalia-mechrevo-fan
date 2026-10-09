@@ -1,0 +1,94 @@
+# Mechrevo Fan Control (Noctalia v5 插件)
+# 状态栏风扇部件 + 控制面板,经 mechrevo-fanctl 访问 /dev/tuxedo_io。
+
+id = "7yunluo/mechrevo-fan"
+name = "Mechrevo Fan Control"
+version = "0.1.0"
+plugin_api = 9
+author = "7yunluo"
+license = "MIT"
+icon = "car-fan"
+description = "Fan control and monitoring for MECHREVO WUJIE laptops (Uniwill EC via mechrevo-drivers)."
+dependencies = ["mechrevo-fanctl"]
+tags = ["hardware", "fan", "system"]
+
+# ── 插件设置 ────────────────────────────────────────────────────────────────
+
+[[setting]]
+key = "poll_interval_ms"
+type = "int"
+default = 2000
+min = 1000
+max = 10000
+step = 500
+label_key = "settings.poll_interval_ms.label"
+description_key = "settings.poll_interval_ms.description"
+
+[[setting]]
+key = "sensor"
+type = "select"
+default = "cpu"
+label_key = "settings.sensor.label"
+description_key = "settings.sensor.description"
+options = [
+  { label_key = "settings.sensor.options.cpu", value = "cpu" },
+  { label_key = "settings.sensor.options.max", value = "max" },
+]
+
+[[setting]]
+key = "curve"
+type = "select"
+default = "balanced"
+label_key = "settings.curve.label"
+description_key = "settings.curve.description"
+options = [
+  { label_key = "settings.curve.options.quiet", value = "quiet" },
+  { label_key = "settings.curve.options.balanced", value = "balanced" },
+  { label_key = "settings.curve.options.performance", value = "performance" },
+]
+
+[[setting]]
+key = "min_fan_percent"
+type = "int"
+default = 0
+min = 0
+max = 60
+step = 5
+label_key = "settings.min_fan_percent.label"
+description_key = "settings.min_fan_percent.description"
+
+[[setting]]
+key = "safety_temp_c"
+type = "int"
+default = 95
+min = 70
+max = 105
+step = 1
+label_key = "settings.safety_temp_c.label"
+description_key = "settings.safety_temp_c.description"
+
+[[setting]]
+key = "helper_path"
+type = "string"
+default = "mechrevo-fanctl"
+label_key = "settings.helper_path.label"
+description_key = "settings.helper_path.description"
+
+# ── 入口 ────────────────────────────────────────────────────────────────────
+
+[[service]]
+id = "service"
+entry = "service.luau"
+
+[[widget]]
+id = "fan"
+entry = "widget.luau"
+
+[[panel]]
+id = "control"
+entry = "panel.luau"
+width = 380
+height = 430
+placement = "attached"
+position = "auto"
+open_near_click = true

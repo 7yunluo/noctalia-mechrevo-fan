@@ -1,0 +1,75 @@
+{
+  "panel": {
+    "title": "Mechrevo Fan",
+    "status": "Hardware Status",
+    "mode": "Control Mode",
+    "curve": "Fan Curve",
+    "manual_speed": "Manual Speed",
+    "manual_hint": "Speeds below 25% are clamped by the EC to its minimum step; that is hardware behaviour",
+    "fan_left": "Left Fan",
+    "fan_right": "Right Fan",
+    "temp": "Temp",
+    "live_hint": "Manual/curve mode active; click Auto to hand control back to the EC"
+  },
+  "widget": {
+    "mode": {
+      "auto": "Auto",
+      "curve": "Curve",
+      "manual": "Manual"
+    },
+    "tooltip": {
+      "fan_left": "Left fan",
+      "fan_right": "Right fan",
+      "mode": "Mode",
+      "temp": "Temp",
+      "error": "Error"
+    },
+    "left_unavailable": "unavailable (driver patch missing)"
+  },
+  "curve": {
+    "quiet": "Quiet",
+    "balanced": "Balanced",
+    "performance": "Performance"
+  },
+  "settings": {
+    "poll_interval_ms": {
+      "label": "Poll interval (ms)",
+      "description": "How often fan state is read"
+    },
+    "sensor": {
+      "label": "Temperature sensor",
+      "description": "Which temperature drives the curve",
+      "options": {
+        "cpu": "CPU temp",
+        "max": "Max of both"
+      }
+    },
+    "curve": {
+      "label": "Default curve",
+      "description": "Default temperature-speed table for curve mode",
+      "options": {
+        "quiet": "Quiet",
+        "balanced": "Balanced",
+        "performance": "Performance"
+      }
+    },
+    "min_fan_percent": {
+      "label": "Minimum speed floor (%)",
+      "description": "Speed floor in curve mode; 0 allows the fans to stop"
+    },
+    "safety_temp_c": {
+      "label": "Safety temperature (°C)",
+      "description": "At this temperature control returns to the EC immediately"
+    },
+    "helper_path": {
+      "label": "Helper path",
+      "description": "Path to the mechrevo-fanctl executable"
+    }
+  },
+  "notify": {
+    "safety": {
+      "title": "Fan thermal protection",
+      "body": "Temperature reached {temp}°C; control returned to the EC"
+    }
+  }
+}
