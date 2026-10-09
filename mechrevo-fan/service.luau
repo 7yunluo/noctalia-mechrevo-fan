@@ -363,8 +363,12 @@ function onEnable()
 end
 
 function onExit(_signal, reason)
-  -- 插件停用或外壳退出时交还 EC 控制,避免风扇停在手动值上
+  -- 插件停用或外壳退出时交还 EC 控制,并把持久化模式重置为 auto,
+  -- 避免下次启动时突然夺回风扇(期间 EC 可能已经按自己的曲线调整过)
   if desiredMode ~= MODE_AUTO and reason ~= "reload" then
+    desiredMode = MODE_AUTO
+    isLive = false
+    publish()
     noctalia.runAsync(helper() .. " auto", nil, 2000)
   end
 end
