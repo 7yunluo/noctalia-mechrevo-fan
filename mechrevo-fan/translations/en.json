@@ -26,6 +26,14 @@
     },
     "left_unavailable": "unavailable (driver patch missing)"
   },
+  "error": {
+    "device-missing": "Device node not found",
+    "permission-denied": "Permission denied",
+    "helper-missing": "Helper not found",
+    "read-failed": "Failed to read status",
+    "parse": "Could not parse helper output",
+    "write-failed": "Failed to set fan speed"
+  },
   "curve": {
     "quiet": "Quiet",
     "balanced": "Balanced",

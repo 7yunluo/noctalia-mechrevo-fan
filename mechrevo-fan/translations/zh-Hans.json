@@ -26,6 +26,14 @@
     },
     "left_unavailable": "不可用(驱动未打补丁)"
   },
+  "error": {
+    "device-missing": "找不到设备节点",
+    "permission-denied": "权限不足",
+    "helper-missing": "找不到 helper",
+    "read-failed": "读取状态失败",
+    "parse": "无法解析 helper 输出",
+    "write-failed": "设置风扇转速失败"
+  },
   "curve": {
     "quiet": "安静",
     "balanced": "均衡",

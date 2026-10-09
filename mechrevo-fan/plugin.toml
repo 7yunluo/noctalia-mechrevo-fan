@@ -70,7 +70,7 @@ description_key = "settings.safety_temp_c.description"
 [[setting]]
 key = "helper_path"
 type = "string"
-default = "mechrevo-fanctl"
+default = "~/.local/bin/mechrevo-fanctl"
 label_key = "settings.helper_path.label"
 description_key = "settings.helper_path.description"
 

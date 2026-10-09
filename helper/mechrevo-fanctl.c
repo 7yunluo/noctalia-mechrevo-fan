@@ -7,7 +7,8 @@
  *   mechrevo-fanctl set <0|1> <0-200>      设置风扇占空比(200 = 100%)
  *   mechrevo-fanctl auto                   交还 EC 自动控制
  *
- * 退出码: 0 成功; 1 设备错误; 2 参数错误; 3 设备不存在。
+ * 退出码: 0 成功; 1 设备错误; 2 参数错误; 3 设备不存在; 4 权限不足;
+ *         5 状态读取失败(ioctl 出错,JSON 中 ok=false)。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,20 +33,33 @@
 #define W_UW_FANSPEED2 _IOW(MAGIC_WRITE_UW, 0x11, int32_t *)
 #define W_UW_FANAUTO   _IO(MAGIC_WRITE_UW, 0x14)
 
+#define RC_DEVICE_MISSING 3   /* 设备节点不存在 */
+#define RC_PERMISSION     4   /* 设备存在但权限不足 */
+#define RC_STATUS_IOCTL   5   /* status 读取失败 */
+
+/* 打开设备节点,区分「不存在」与「权限不足」两种失败。 */
 static int open_dev(void)
 {
     int fd = open("/dev/tuxedo_io", O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "open /dev/tuxedo_io: %s\n", strerror(errno));
+        if (errno == ENOENT)
+            return -RC_DEVICE_MISSING;
+        if (errno == EACCES || errno == EPERM)
+            return -RC_PERMISSION;
         return -1;
     }
     return fd;
 }
 
-static void read_or(int fd, unsigned long req, int32_t *out)
+/* 读一个寄存器;ioctl 出错或驱动回填负值(错误哨兵)都算读取失败。 */
+static int read_or(int fd, unsigned long req, int32_t *out)
 {
-    if (ioctl(fd, req, out) < 0)
+    if (ioctl(fd, req, out) < 0 || *out < 0) {
         *out = -1;
+        return 0;
+    }
+    return 1;
 }
 
 static int cmd_status(int fd)
@@ -53,17 +67,20 @@ static int cmd_status(int fd)
     int32_t fan0 = -1, fan1 = -1, temp0 = -1, temp1 = -1;
     int32_t mode = -1, minspeed = -1;
 
-    read_or(fd, R_UW_FANSPEED, &fan0);
-    read_or(fd, R_UW_FANSPEED2, &fan1);
-    read_or(fd, R_UW_FAN_TEMP, &temp0);
-    read_or(fd, R_UW_FAN_TEMP2, &temp1);
-    read_or(fd, R_UW_MODE, &mode);
-    read_or(fd, R_UW_FANS_MIN_SPEED, &minspeed);
+    /* 关键字段任一 ioctl 失败则整体视为不健康 */
+    int ok = 1;
+    ok &= read_or(fd, R_UW_FANSPEED, &fan0);
+    ok &= read_or(fd, R_UW_FANSPEED2, &fan1);
+    ok &= read_or(fd, R_UW_FAN_TEMP, &temp0);
+    ok &= read_or(fd, R_UW_FAN_TEMP2, &temp1);
+    ok &= read_or(fd, R_UW_MODE, &mode);
+    ok &= read_or(fd, R_UW_FANS_MIN_SPEED, &minspeed);
 
-    printf("{\"ok\":true,\"fan0\":%d,\"fan1\":%d,\"temp0\":%d,\"temp1\":%d,"
+    printf("{\"ok\":%s,\"fan0\":%d,\"fan1\":%d,\"temp0\":%d,\"temp1\":%d,"
            "\"mode\":%d,\"minSpeed\":%d,\"scale\":200}\n",
+           ok ? "true" : "false",
            fan0, fan1, temp0, temp1, mode, minspeed);
-    return 0;
+    return ok ? 0 : RC_STATUS_IOCTL;
 }
 
 static int cmd_set(int fd, int idx, long raw)
@@ -85,7 +102,7 @@ int main(int argc, char **argv)
 
     fd = open_dev();
     if (fd < 0)
-        return 3;
+        return -fd;
 
     if (strcmp(cmd, "status") == 0) {
         int rc = cmd_status(fd);

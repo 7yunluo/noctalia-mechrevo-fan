@@ -84,12 +84,64 @@ local function cfg(key)
   return noctalia.getConfig(key)
 end
 
-local function helper()
-  local path = cfg("helper_path")
-  if type(path) ~= "string" or path == "" then
-    path = "mechrevo-fanctl"
+local DEFAULT_HELPER = "~/.local/bin/mechrevo-fanctl"
+
+-- 展开路径开头的 ~,以 HOME 环境变量为基准
+local function expandHome(path)
+  if type(path) ~= "string" or path:sub(1, 1) ~= "~" then
+    return path
+  end
+  local home = noctalia.getenv("HOME")
+  if type(home) ~= "string" or home == "" then
+    return path
+  end
+  if path == "~" then
+    return home
+  end
+  if path:sub(1, 2) == "~/" then
+    return home .. path:sub(2)
   end
   return path
+end
+
+-- 解析 helper 路径:展开 ~,只放行安全字符,非法时返回 nil
+local function helperPath()
+  local path = cfg("helper_path")
+  if type(path) ~= "string" or path == "" then
+    path = DEFAULT_HELPER
+  end
+  path = expandHome(path)
+  if type(path) ~= "string" or not path:match("^[A-Za-z0-9/_.~%-]+$") then
+    return nil
+  end
+  return path
+end
+
+-- 拼 helper 命令用的路径;非法路径返回 nil,调用方按 helper-missing 处理
+local function helperQuoted()
+  local path = helperPath()
+  if not path then
+    return nil
+  end
+  -- 白名单已排除单引号,整体再套单引号即可安全插入 shell 命令
+  return "'" .. path .. "'"
+end
+
+-- 已知错误码 -> 翻译键,未知码原样输出
+local ERROR_CODES = {
+  ["device-missing"] = true,
+  ["permission-denied"] = true,
+  ["helper-missing"] = true,
+  ["read-failed"] = true,
+  ["parse"] = true,
+  ["write-failed"] = true,
+}
+
+local function errText(code)
+  if ERROR_CODES[code] then
+    return noctalia.tr("error." .. code)
+  end
+  return code
 end
 
 -- 判断温度是否可用,<=0 或非数字视为无效(部分机型温度通道恒为 0)
@@ -183,7 +235,7 @@ local function publish()
     curve = status.curve,
     sensor = status.sensor,
     safetyTempC = status.safetyTempC,
-    error = status.error,
+    error = errText(status.error),
     live = isLive,
   })
   noctalia.state.set(LAST, {
@@ -194,9 +246,10 @@ local function publish()
   })
 end
 
+-- 解析 status JSON;decode 失败或 ok 非 true 都视为不健康
 local function parseStatus(stdout)
-  local decoded = noctalia.json.decode(stdout)
-  if type(decoded) ~= "table" then
+  local ok, decoded = pcall(noctalia.json.decode, stdout)
+  if not ok or type(decoded) ~= "table" or decoded.ok ~= true then
     return false
   end
   status.fan0 = tonumber(decoded.fan0) or -1
@@ -208,33 +261,50 @@ local function parseStatus(stdout)
   return true
 end
 
+-- 非 0 退出码 -> 后端状态与错误码;退出码区分设备缺失/权限/helper 缺失
+local function backendFromRc(rc)
+  if rc == 3 then
+    return false, "device-missing"
+  elseif rc == 4 then
+    return false, "permission-denied"
+  elseif rc == 5 then
+    return false, "read-failed"
+  elseif rc == 127 then
+    return false, "helper-missing"
+  end
+  return true, "parse"
+end
+
 local function refresh(onDone)
   if reading then
     if onDone then onDone() end
     return
   end
-  reading = true
-  local ok = noctalia.runAsync(helper() .. " status", function(result)
-    reading = false
-    local rc = result.exitCode
-    if rc == 0 and parseStatus(result.stdout or "") then
-      backendState = true
-      status.error = ""
-    elseif rc == 0 then
-      backendState = true
-      status.error = "parse"
-    elseif rc == 3 then
-      backendState = false
-      status.error = "device-missing"
-    elseif rc == 127 then
-      backendState = false
-      status.error = "helper-missing"
-    else
-      backendState = false
-      status.error = "read-failed"
-    end
+  local quoted = helperQuoted()
+  if not quoted then
+    backendState = false
+    status.error = "helper-missing"
     publish()
     if onDone then onDone() end
+    return
+  end
+  reading = true
+  local ok = noctalia.runAsync(quoted .. " status", function(result)
+    -- 回调任一步出错也要复位 reading 并发布,否则刷新将永久停摆
+    pcall(function()
+      reading = false
+      local rc = result.exitCode
+      local healthy = rc == 0 and parseStatus(result.stdout or "")
+      if healthy then
+        backendState = true
+        status.error = ""
+      else
+        backendState, status.error = backendFromRc(rc)
+      end
+      publish()
+      if onDone then onDone() end
+    end)
+    reading = false
   end, 3000)
   if not ok then
     reading = false
@@ -248,7 +318,13 @@ end
 -- 交还 EC 自动控制。置位与写入结果无关:desiredMode 已由调用方置为 auto,
 -- 保证交还失败时 tick 不会再把手动/曲线值写回去,避免与过热保护对打。
 local function sendAuto()
-  noctalia.runAsync(helper() .. " auto", function(result)
+  local quoted = helperQuoted()
+  if not quoted then
+    status.error = "helper-missing"
+    publish()
+    return
+  end
+  noctalia.runAsync(quoted .. " auto", function(result)
     if result.exitCode == 0 then
       status.targetRaw = 0
     else
@@ -266,23 +342,32 @@ local function applyRaw(raw)
     status.targetRaw = raw
     return
   end
+  local quoted = helperQuoted()
+  if not quoted then
+    status.error = "helper-missing"
+    publish()
+    return
+  end
   writing = true
   status.targetRaw = raw
-  local h = helper()
-  local cmd = h .. " set 0 " .. tostring(raw) .. " && " .. h .. " set 1 " .. tostring(raw)
+  local cmd = quoted .. " set 0 " .. tostring(raw) .. " && " .. quoted .. " set 1 " .. tostring(raw)
   noctalia.runAsync(cmd, function(result)
+    -- 回调任一步出错也要复位 writing 并发布,否则后续写入请求全部被吞
+    pcall(function()
+      writing = false
+      if result.exitCode == 0 then
+        status.appliedRaw = raw
+      else
+        status.error = "write-failed"
+      end
+      publish()
+      if pendingRaw ~= nil then
+        local next = pendingRaw
+        pendingRaw = nil
+        applyRaw(next)
+      end
+    end)
     writing = false
-    if result.exitCode == 0 then
-      status.appliedRaw = raw
-    else
-      status.error = "write-failed"
-    end
-    publish()
-    if pendingRaw ~= nil then
-      local next = pendingRaw
-      pendingRaw = nil
-      applyRaw(next)
-    end
   end, 3000)
 end
 
@@ -462,7 +547,10 @@ function onExit(_signal, reason)
     desiredMode = MODE_AUTO
     isLive = false
     publish()
-    noctalia.runAsync(helper() .. " auto", nil, 2000)
+    local quoted = helperQuoted()
+    if quoted then
+      noctalia.runAsync(quoted .. " auto", nil, 2000)
+    end
   end
 end
 
