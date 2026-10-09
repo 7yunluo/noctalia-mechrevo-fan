@@ -4,12 +4,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
+TMP_BIN="$BIN_DIR/.mechrevo-fanctl.tmp"
+
+# 脚本退出(含出错中断)时清理编译临时文件
+trap 'rm -f "$TMP_BIN"' EXIT
 
 echo "==> 编译 mechrevo-fanctl"
-gcc -O2 -o "$BIN_DIR/.mechrevo-fanctl.tmp" "$ROOT/helper/mechrevo-fanctl.c"
 mkdir -p "$BIN_DIR"
-install -m755 "$BIN_DIR/.mechrevo-fanctl.tmp" "$BIN_DIR/mechrevo-fanctl"
-rm -f "$BIN_DIR/.mechrevo-fanctl.tmp"
+gcc -O2 -o "$TMP_BIN" "$ROOT/helper/mechrevo-fanctl.c"
+install -m755 "$TMP_BIN" "$BIN_DIR/mechrevo-fanctl"
 echo "    -> $BIN_DIR/mechrevo-fanctl"
 
 echo "==> 安装 udev 规则(需要 sudo)"
