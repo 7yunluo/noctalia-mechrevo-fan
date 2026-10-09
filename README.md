@@ -18,9 +18,18 @@ Noctalia v5 状态栏风扇插件 + Uniwill EC 风扇控制 helper,用于机械�
 | `W_UW_FANSPEED2`(fan1→0x1809)写 150/200 | `fan1` 读数不变,**无效** |
 | `W_UW_FANAUTO` | 恢复自动模式,两风扇重新受 EC 控制,**有效** |
 
-结论:驱动未打补丁时,**只有 fan0 这一条路能直接控制转速**。若要恢复左风扇写入,
-需要重新应用共享表补丁(见"驱动补丁"一节);在此之前,本插件的写操作会同时写
-fan0 与 fan1(冗余、无害),实际生效的只有 fan0。
+当时据此得出「只有 fan0 能直控、fan1 写入无效」的结论。后续逐行核对内核源码发现,
+上表这几次 fan1 写入是在全风扇模式已关闭(`0x0751` bit6 未置位)时做的:官方
+`uw_set_fan()` 在这种情况下会先调 `uw_init_fan()`,而该函数会读 `0x07c5`/`0x07c6`
+并回写;随后落到寄存器上的写入并未被 EC 采纳,读数因此不变。也就是说,「无效」来自
+初始化那一步,而不是 fan1 写不进去。(2026-10-09 之前的补丁在这条路径上尤其危险:
+初始化会做持锁的 WMI 重试,连写 fan1 可把 EC 卡死。)
+
+新版补丁(2026-10-09,4 hunk:decl / init 早退 / dmi / setfan)给 `uw_init_fan()` 加了
+`fans_initialized` 早退,让稳态写入只做单次寄存器写,不再触发上述初始化。按这条路径,
+**未打补丁时 fan1 同样能直控**;补丁的意义因此不再是「能不能写」,而是写到正确的表——
+WUJIE 机型左右风扇共用同一张 CPU 表,补丁让 fan1 用 CPU 表地址 `0x0f20`,而不是 EC
+不响应的 GPU 表地址 `0x0f50`。
 
 ### EC 行为(实测)
 - 写入值 < 约 25%(原始值 50)时,EC 会把持续占空比夹到最低档(读数约 8~26);
@@ -30,25 +39,25 @@ fan0 与 fan1(冗余、无害),实际生效的只有 fan0。
 ## 安装
 
 - **helper 编译 + udev 规则 + 探测**:运行 `./install.sh`,一键完成
-- **驱动补丁(恢复左风扇)**:运行 `sudo python3 scripts/apply-driver-patch.py`,再执行:
+- **驱动补丁(让左风扇写入共享 CPU 表)**:运行 `sudo python3 scripts/apply-driver-patch.py`,再执行:
 
 ```sh
 sudo dkms remove mechrevo-drivers/4.22.3 --all
 sudo dkms install mechrevo-drivers/4.22.3 -k <新内核版本>
 ```
 
-打完补丁后重启,左风扇恢复直控。注意:驱动包升级会覆盖 `/usr/src/`,补丁需重打。
+打完补丁后重启,左风扇写入共享 CPU 表。注意:驱动包升级会覆盖 `/usr/src/`,补丁需重打。
 
 ## 使用
 
 - **状态栏部件**:显示 `占空比% 温度°`,点击循环切换 自动 → 曲线 → 手动;右键打开控制面板
 - **控制面板**:三种模式(自动/曲线/手动)、手动滑块、风扇曲线选择、状态展示
-- **CLI**:`mechrevo-fanctl status` 查看状态;`set 0 <raw>` 设右风扇;`set 1 <raw>` 设左风扇(需驱动补丁);`auto` 交还 EC
+- **CLI**:`mechrevo-fanctl status` 查看状态;`set 0 <raw>` 设右风扇;`set 1 <raw>` 设左风扇(打补丁后写入共享 CPU 表);`auto` 交还 EC
 
 ## 排障
 
 - `mechrevo-fanctl status` 报 `Permission denied`:检查 `/dev/tuxedo_io` 属组是否为 `plugdev`,当前用户是否在 `plugdev` 组
-- 左风扇 `set 1` 无反应:驱动未打补丁,参照上文「安装」节
+- 左风扇 `set 1` 读数不变:确认驱动补丁是否生效(`set 1` 走 GPU 表 `0x0f50` 时读数不会跟随),参照上文「安装」节重打补丁
 - 部件显示 `--`:运行 `noctalia msg plugins list` 确认插件已启用,再检查 `~/.local/bin/mechrevo-fanctl` 是否存在
 
 ## 背景:为什么需要这个插件
@@ -58,7 +67,8 @@ sudo dkms install mechrevo-drivers/4.22.3 -k <新内核版本>
 本插件绕开 EC 自动模式,经 `/dev/tuxedo_io` 直写风扇寄存器。历史的驱动补丁修复
 (两风扇共用 CPU 表 `0x0f20`)在 2026-09-22 驱动包升级 4.22.1 → 4.22.3 时被覆盖,
 由 `scripts/apply-driver-patch.py` 重新固化——把 `uw_set_fan()` 里 fan1 的目标表
-从 GPU 表改回 CPU 表,两风扇即可各自独立直控。
+从 GPU 表改回 CPU 表,让左风扇的写入落到这张共享表上。补丁的作用不是「让 fan1 能写」
+(这条写路径本身是通的),而是让 fan1 写到 EC 真正响应的 CPU 表地址。
 
 ## 仓库结构
 
