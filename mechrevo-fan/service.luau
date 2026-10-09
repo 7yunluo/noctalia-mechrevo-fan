@@ -194,7 +194,9 @@ local writeStage = nil -- nil=空闲 / "fan0"=右路已发 / "fan1"=左路已发
 local writeRoundRaw = nil -- 当前一轮写入的冻结目标,保证左右两路同值
 local lastWriteAt = 0 -- 上一轮(左右两路)完成时刻
 local appliedRaw = nil -- EC 已确认的占空比
-local appliedMode = MODE_AUTO -- EC 已确认的控制模式
+local appliedMode = nil -- EC 已确认的控制模式;nil=尚未确认,启动时就绪后补发一次 auto
+local appliedProbed = false -- 启动后是否已读通一次(补交还以此确认 EC 可达)
+local startupHandback = false -- 当前 auto Op 是否为启动补交还(交还后立即恢复读节奏)
 local statusEarliestAt = 0
 local nextReadAt = 0
 local probeAt = 0
@@ -318,6 +320,7 @@ local function handleResult(op, result)
       local parsed, code = parseStatus(result.stdout or "")
       if parsed then
         clearHealthy("read")
+        appliedProbed = true -- 首次读通即确认 EC 可达
         nextReadAt = nowMs + pollInterval()
         engineRecomputeTarget()
         publish()
@@ -370,11 +373,16 @@ local function handleResult(op, result)
   end
 
   -- auto
+  local startup = startupHandback
+  startupHandback = false
   if not result.spawnFailed and result.exitCode == 0 then
     clearHealthy("write")
     appliedMode = MODE_AUTO
-    statusEarliestAt = nowMs + POST_WRITE_SETTLE_MS
-    nextReadAt = statusEarliestAt
+    -- 启动补交还后立即恢复读节奏;其余 auto 仍延后读,避开刚写完的锁竞争
+    if not startup then
+      statusEarliestAt = nowMs + POST_WRITE_SETTLE_MS
+      nextReadAt = statusEarliestAt
+    end
     publish()
     return
   end
@@ -496,7 +504,14 @@ schedulerTick = function()
     -- 放弃未完成的写轮次:auto 应接管,不再补写另一路
     writeStage = nil
     writeRoundRaw = nil
-    if appliedMode ~= MODE_AUTO and not writeBackoff then
+    if appliedMode == nil then
+      -- 启动补交还:等首个读确认 EC 可达再发,读不通则不盲发
+      if appliedProbed and not writeBackoff then
+        startupHandback = true
+        startOp("auto", nil, WATCHDOG_MS.auto, false)
+        return
+      end
+    elseif appliedMode ~= MODE_AUTO and not writeBackoff then
       startOp("auto", nil, WATCHDOG_MS.auto, false)
       return
     end
@@ -875,7 +890,8 @@ function onEnable()
   -- 启动默认 auto,不夺权
   desired.mode = MODE_AUTO
   desired.targetRaw = nil
-  appliedMode = MODE_AUTO
+  -- 上次退出可能没交还(崩溃),EC 模式未知:交由调度器补一次 auto
+  appliedMode = nil
   noctalia.setUpdateInterval(SCHED_TICK_MS)
   publish()
   schedulerRequestRead()
