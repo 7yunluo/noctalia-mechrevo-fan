@@ -104,17 +104,22 @@ local function expandHome(path)
   return path
 end
 
--- 解析 helper 路径:展开 ~,只放行安全字符,非法时返回 nil
-local function helperPath()
-  local path = cfg("helper_path")
-  if type(path) ~= "string" or path == "" then
-    path = DEFAULT_HELPER
-  end
+-- 校验 helper 路径:展开 ~,只放行安全字符,非法时返回 nil
+local function sanitizeHelper(path)
   path = expandHome(path)
   if type(path) ~= "string" or not path:match("^[A-Za-z0-9/_.~%-]+$") then
     return nil
   end
   return path
+end
+
+-- 读取配置里的 helper 路径;未配置或配置非法时返回 nil
+local function helperPath()
+  local path = cfg("helper_path")
+  if type(path) ~= "string" or path == "" then
+    path = DEFAULT_HELPER
+  end
+  return sanitizeHelper(path)
 end
 
 -- 拼 helper 命令用的路径;非法路径返回 nil,调用方按 helper-missing 处理
@@ -125,6 +130,20 @@ local function helperQuoted()
   end
   -- 白名单已排除单引号,整体再套单引号即可安全插入 shell 命令
   return "'" .. path .. "'"
+end
+
+-- 解析可用的 helper 命令:先试用户配置,非法则退回默认路径。
+-- 第二个返回值表示是否用了默认路径兜底;两者都不可用时返回 nil。
+local function resolveHelperQuoted()
+  local path = helperPath()
+  if path then
+    return "'" .. path .. "'", false
+  end
+  path = sanitizeHelper(DEFAULT_HELPER)
+  if not path then
+    return nil, false
+  end
+  return "'" .. path .. "'", true
 end
 
 -- 已知错误码 -> 翻译键,未知码原样输出
@@ -546,8 +565,12 @@ function onExit(_signal, reason)
   if desiredMode ~= MODE_AUTO and reason ~= "reload" then
     desiredMode = MODE_AUTO
     isLive = false
+    -- 配置的 helper 非法时退回默认路径再交还;退回或两者皆废都记一笔
+    local quoted, fallback = resolveHelperQuoted()
+    if fallback or not quoted then
+      status.error = "helper-missing"
+    end
     publish()
-    local quoted = helperQuoted()
     if quoted then
       noctalia.runAsync(quoted .. " auto", nil, 2000)
     end
