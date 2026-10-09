@@ -22,6 +22,7 @@ local MODE_MANUAL = "manual"
 local MODE_CURVE = "curve"
 
 local CURVE_NAMES = { "quiet", "balanced", "performance" }
+-- 滑块预览值:拖拽中以及松手后等待服务确认期间使用,避免回弹到旧值
 local sliderPreview = nil
 local render -- 前向声明:各控件的回调在 render 定义前引用它
 
@@ -133,12 +134,11 @@ local function manualSection()
         sliderPreview = tonumber(v) or shown
         render()
       end,
-      onDragEnd = function()
-        local target = sliderPreview
-        sliderPreview = nil
-        if target ~= nil then
-          send({ action = "set_raw", raw = target })
-        end
+      onDragEnd = function(v)
+        -- 保留预览值直到服务确认(targetRaw 追上),否则快照回传旧值会让滑块回弹
+        local target = sliderPreview or tonumber(v) or shown
+        sliderPreview = target
+        send({ action = "set_raw", raw = target })
       end,
     }),
     ui.label({
@@ -187,6 +187,10 @@ end
 noctalia.state.watch(SNAPSHOT, function(val)
   if type(val) == "table" then
     snap = val
+    -- 服务端已确认写入目标值,预览使命完成,交还给快照驱动
+    if sliderPreview ~= nil and tonumber(snap.targetRaw) == sliderPreview then
+      sliderPreview = nil
+    end
     render()
   end
 end)

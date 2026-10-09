@@ -76,6 +76,7 @@ local backendState = nil -- nil=未探测, true=可用, false=不可用
 
 local reading = false
 local writing = false
+local pendingRaw = nil -- 写入进行中收到的最新目标值
 
 local function cfg(key)
   return noctalia.getConfig(key)
@@ -235,8 +236,11 @@ local function sendAuto(onDone)
 end
 
 -- 写两个风扇的目标占空比。左风扇在驱动修复后走共享曲线表,此处同步写入两条路径。
+-- 写入进行中若有新目标,记为 pending,当前写完成后立即补写,避免快速拖动滑块丢值。
 local function applyRaw(raw)
   if writing then
+    pendingRaw = raw
+    status.targetRaw = raw
     return
   end
   writing = true
@@ -251,6 +255,11 @@ local function applyRaw(raw)
       status.error = "write-failed"
     end
     publish()
+    if pendingRaw ~= nil then
+      local next = pendingRaw
+      pendingRaw = nil
+      applyRaw(next)
+    end
   end, 3000)
 end
 
@@ -280,6 +289,8 @@ end
 local function setMode(mode, raw)
   if mode == MODE_AUTO then
     isLive = false
+    desiredMode = MODE_AUTO
+    publish()
     sendAuto()
   elseif mode == MODE_MANUAL then
     isLive = true
@@ -287,10 +298,12 @@ local function setMode(mode, raw)
     if raw then
       desiredRaw = math.max(0, math.min(RAW_MAX, tonumber(raw) or desiredRaw))
     end
+    publish()
     applyRaw(desiredRaw)
   elseif mode == MODE_CURVE then
     isLive = true
     desiredMode = MODE_CURVE
+    publish()
     applyRaw(curveRaw())
   end
 end
