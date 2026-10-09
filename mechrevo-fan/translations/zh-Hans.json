@@ -69,7 +69,11 @@
   "notify": {
     "safety": {
       "title": "风扇过热保护",
-      "body": "温度达到 {temp}°C,已交还 EC 自动控制"
+      "body": "温度达到 {temp}°C,已将控制交还 EC"
+    },
+    "sensor": {
+      "title": "风扇温度不可用",
+      "body": "温度读数无效,已将控制交还 EC"
     }
   }
 }

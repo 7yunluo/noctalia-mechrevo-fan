@@ -69,7 +69,11 @@
   "notify": {
     "safety": {
       "title": "Fan thermal protection",
-      "body": "Temperature reached {temp}°C; control returned to the EC"
+      "body": "Temperature reached {temp}°C; control handed back to the EC"
+    },
+    "sensor": {
+      "title": "Fan temperature unavailable",
+      "body": "Temperature reading is invalid; control handed back to the EC"
     }
   }
 }

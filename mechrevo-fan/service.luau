@@ -77,6 +77,8 @@ local backendState = nil -- nil=未探测, true=可用, false=不可用
 local reading = false
 local writing = false
 local pendingRaw = nil -- 写入进行中收到的最新目标值
+local safetyNotified = false -- 过热通知节流,温度回落后重置
+local sensorWarned = false -- 温度无效警告节流,温度恢复后重置
 
 local function cfg(key)
   return noctalia.getConfig(key)
@@ -90,10 +92,19 @@ local function helper()
   return path
 end
 
+-- 判断温度是否可用,<=0 或非数字视为无效(部分机型温度通道恒为 0)
+local function tempValid(temp)
+  return temp ~= nil and temp == temp and temp > 0
+end
+
+-- 取当前传感器温度;无效时返回非正值,由调用方决定如何处理
 local function sensorTemp()
   local t0 = tonumber(status.temp0) or -1
   local t1 = tonumber(status.temp1) or -1
   if cfg("sensor") == "max" then
+    if t0 <= 0 and t1 <= 0 then
+      return -1
+    end
     return math.max(t0, t1)
   end
   if t0 > 0 then
@@ -141,12 +152,22 @@ local function curveRaw()
   return math.max(0, math.min(RAW_MAX, raw))
 end
 
+-- 计算曲线目标值;温度无效时返回 nil,请求交还 auto。
+-- 用 auto 而非沿用旧值:传感器故障下曲线无法跟随温度,保持旧值可能既过热又过吵。
+local function curveTarget()
+  if not tempValid(sensorTemp()) then
+    return nil
+  end
+  return curveRaw()
+end
+
 local function publish()
   status.ok = backendState == true
   status.modeName = desiredMode
   status.sensor = cfg("sensor") or "cpu"
   status.safetyTempC = tonumber(cfg("safety_temp_c")) or 95
   status.scale = RAW_MAX
+  status.curve = curveName()
   noctalia.state.set(SNAPSHOT, {
     ok = status.ok,
     fan0 = status.fan0,
@@ -224,12 +245,14 @@ local function refresh(onDone)
   end
 end
 
-local function sendAuto(onDone)
+-- 交还 EC 自动控制。置位与写入结果无关:desiredMode 已由调用方置为 auto,
+-- 保证交还失败时 tick 不会再把手动/曲线值写回去,避免与过热保护对打。
+local function sendAuto()
   noctalia.runAsync(helper() .. " auto", function(result)
     if result.exitCode == 0 then
-      desiredMode = MODE_AUTO
       status.targetRaw = 0
-      if onDone then onDone() end
+    else
+      status.error = "write-failed"
     end
     publish()
   end, 3000)
@@ -269,21 +292,67 @@ local function applyDesired()
   elseif desiredMode == MODE_MANUAL then
     applyRaw(desiredRaw)
   elseif desiredMode == MODE_CURVE then
-    applyRaw(curveRaw())
+    local raw = curveTarget()
+    -- 曲线模式下但没有有效温度时交还 auto,而非写入低值。只改意向不动风扇
+    -- 已有档位,下一次 tick 由 auto 分支真正交还。
+    if raw == nil then
+      desiredMode = MODE_AUTO
+      desiredRaw = 0
+      publish()
+    else
+      applyRaw(raw)
+    end
   end
 end
 
 local function safetyCheck()
   local safety = tonumber(cfg("safety_temp_c")) or 95
   local temp = sensorTemp()
-  if desiredMode ~= MODE_AUTO and temp > 0 and temp >= safety then
-    noctalia.notify(
-      noctalia.tr("notify.safety.title"),
-      noctalia.tr("notify.safety.body", { temp = tostring(temp) })
-    )
-    isLive = false
-    sendAuto()
+  if not tempValid(temp) then
+    -- 温度不可用:不写曲线/手动低值,交还 auto 保底,警告只发一次
+    if desiredMode ~= MODE_AUTO then
+      if not sensorWarned then
+        sensorWarned = true
+        noctalia.notify(noctalia.tr("notify.sensor.title"), noctalia.tr("notify.sensor.body"))
+      end
+      desiredMode = MODE_AUTO
+      desiredRaw = 0
+      isLive = false
+      publish()
+    end
+    return
   end
+  sensorWarned = false
+  if desiredMode ~= MODE_AUTO and temp >= safety then
+    -- 立即乐观置位 auto,否则交还失败时下一 tick 会再次触发
+    if not safetyNotified then
+      safetyNotified = true
+      noctalia.notify(
+        noctalia.tr("notify.safety.title"),
+        noctalia.tr("notify.safety.body", { temp = tostring(temp) })
+      )
+    end
+    desiredMode = MODE_AUTO
+    desiredRaw = 0
+    isLive = false
+    publish()
+    sendAuto()
+  elseif temp < safety - 5 then
+    safetyNotified = false
+  end
+end
+
+-- 手动模式初值:优先沿用有效历史值,否则用当前实测占空比,读不到再取中档。
+-- 面板直接切手动时不会因 desiredRaw 为 0 把风扇打到停转。
+local function manualSeedRaw()
+  if desiredRaw > 0 then
+    return desiredRaw
+  end
+  local measured = math.max(tonumber(status.fan0) or -1, tonumber(status.fan1) or -1)
+  if measured > 0 then
+    return math.min(RAW_MAX, measured)
+  end
+  return math.floor(RAW_MAX / 2)
 end
 
 local function setMode(mode, raw)
@@ -297,14 +366,21 @@ local function setMode(mode, raw)
     desiredMode = MODE_MANUAL
     if raw then
       desiredRaw = math.max(0, math.min(RAW_MAX, tonumber(raw) or desiredRaw))
+    else
+      desiredRaw = manualSeedRaw()
     end
     publish()
     applyRaw(desiredRaw)
   elseif mode == MODE_CURVE then
+    if not tempValid(sensorTemp()) then
+      -- 温度无效时曲线无法计算,直接交还 auto,避免写入最低档
+      setMode(MODE_AUTO)
+      return
+    end
     isLive = true
     desiredMode = MODE_CURVE
     publish()
-    applyRaw(curveRaw())
+    applyRaw(curveTarget())
   end
 end
 
@@ -312,7 +388,7 @@ local function cycleMode()
   if desiredMode == MODE_AUTO then
     setMode(MODE_CURVE)
   elseif desiredMode == MODE_CURVE then
-    setMode(MODE_MANUAL, desiredRaw > 0 and desiredRaw or math.floor(RAW_MAX / 2))
+    setMode(MODE_MANUAL)
   else
     setMode(MODE_AUTO)
   end
@@ -330,9 +406,13 @@ local function handleCommand(cmd)
     elseif cmd.action == "set_curve" and type(cmd.name) == "string" then
       if CURVES[cmd.name] then
         desiredCurve = cmd.name
-        status.curve = cmd.name
         if desiredMode == MODE_CURVE then
-          applyRaw(curveRaw())
+          local raw = curveTarget()
+          if raw == nil then
+            setMode(MODE_AUTO)
+          else
+            applyRaw(raw)
+          end
         else
           publish()
         end
