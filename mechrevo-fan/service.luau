@@ -110,8 +110,9 @@ local health = {
   ok = false,
   writable = true,
   error = "",
-  backoff_n = 0,
-  backoffUntil = 0,
+  -- 读/写退避各自计数与期限,互不牵连
+  backoff_n = { read = 0, write = 0 },
+  backoffUntil = { read = 0, write = 0 },
   stuck = false,
   silent = false,
 }
@@ -185,7 +186,7 @@ end
 -- 4. EC SCHEDULER
 -- ══════════════════════════════════════════════════════════════════════════
 
-local inFlight = nil -- { id, kind, raw, startedAt, probe }
+local inFlight = nil -- { id, kind, raw, startedAt, probe, bypass }
 local opSeq = 0
 local pendingWrite = nil -- { raw }: 下一轮写入的目标
 local writeDueAt = nil
@@ -198,10 +199,12 @@ local statusEarliestAt = 0
 local nextReadAt = 0
 local probeAt = 0
 local userIntentUntil = 0
+local bypassUsed = false -- 本次退避内已用掉一次穿透
 
--- 标记用户主动操作,允许一次穿透去抖
+-- 标记用户主动操作,允许一次穿透去抖/退避
 local function schedulerMarkUserIntent()
   userIntentUntil = now() + USER_INTENT_BYPASS_MS
+  bypassUsed = false -- 每次主动操作重新武装一次穿透
 end
 
 -- 把下次读提前,允许穿透退避
@@ -239,18 +242,22 @@ local function classify(result)
   return "parse", false
 end
 
--- 失败处理:致命进静默,其余走指数退避
-local function applyFailure(code, fatal)
+-- 失败处理:致命进静默,其余按操作类型各自指数退避
+local function applyFailure(code, fatal, track)
   health.error = code
+  track = track or "read"
   if fatal then
     health.silent = true
     health.writable = false
     probeAt = now() + SILENT_PROBE_MS
   else
-    health.backoff_n = health.backoff_n + 1
-    local delay = math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * (2 ^ (health.backoff_n - 1)))
-    health.backoffUntil = now() + delay
-    health.writable = (code == "parse" or code == "invalid-args")
+    health.backoff_n[track] = (health.backoff_n[track] or 0) + 1
+    local delay = math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * (2 ^ (health.backoff_n[track] - 1)))
+    health.backoffUntil[track] = now() + delay
+    -- 只有写类结果才动 writable:读失败说明不了后端不可写
+    if track == "write" and code ~= "write-failed" then
+      health.writable = true
+    end
   end
 end
 
@@ -264,12 +271,15 @@ local function enterStuck()
   probeAt = now() + SILENT_PROBE_MS
 end
 
-local function clearHealthy()
+-- 一次成功:ok 恢复,并按操作类型只清自己的退避
+local function clearHealthy(track)
   health.ok = true
   health.error = ""
   health.writable = true
-  health.backoff_n = 0
-  health.backoffUntil = 0
+  if track then
+    health.backoff_n[track] = 0
+    health.backoffUntil[track] = 0
+  end
   health.stuck = false
   health.silent = false
 end
@@ -307,7 +317,7 @@ local function handleResult(op, result)
     if not result.spawnFailed and result.exitCode == 0 then
       local parsed, code = parseStatus(result.stdout or "")
       if parsed then
-        clearHealthy()
+        clearHealthy("read")
         nextReadAt = nowMs + pollInterval()
         engineRecomputeTarget()
         publish()
@@ -315,7 +325,7 @@ local function handleResult(op, result)
       end
       -- 能跑通但 ok=false:标记不可用并退避重读,不误判为卡死
       health.ok = false
-      applyFailure(code, false)
+      applyFailure(code, false, "read")
       publish()
       return
     end
@@ -324,7 +334,7 @@ local function handleResult(op, result)
       enterStuck()
     else
       local code, fatal = classify(result)
-      applyFailure(code, fatal)
+      applyFailure(code, fatal, "read")
     end
     publish()
     return
@@ -333,7 +343,7 @@ local function handleResult(op, result)
   -- write(单风扇);左右两路成对下发,以左路(fan1)完成作为整轮写入完成
   if op.kind == "write" then
     if not result.spawnFailed and result.exitCode == 0 then
-      clearHealthy()
+      clearHealthy("write")
       appliedMode = "write"
       if op.fan == 1 then
         appliedRaw = op.raw
@@ -353,7 +363,7 @@ local function handleResult(op, result)
       enterStuck()
     else
       local code, fatal = classify(result)
-      applyFailure(code, fatal)
+      applyFailure(code, fatal, "write")
     end
     publish()
     return
@@ -361,7 +371,7 @@ local function handleResult(op, result)
 
   -- auto
   if not result.spawnFailed and result.exitCode == 0 then
-    clearHealthy()
+    clearHealthy("write")
     appliedMode = MODE_AUTO
     statusEarliestAt = nowMs + POST_WRITE_SETTLE_MS
     nextReadAt = statusEarliestAt
@@ -372,7 +382,7 @@ local function handleResult(op, result)
     enterStuck()
   else
     local code, fatal = classify(result)
-    applyFailure(code, fatal)
+    applyFailure(code, fatal, "write")
   end
   publish()
 end
@@ -383,6 +393,10 @@ local function onOpDone(id, result)
   if op and op.id == id then
     pcall(handleResult, op, result)
     pcall(function()
+      if op.bypass then
+        bypassUsed = false -- 穿透已送达,下次退避可再穿透一次
+        userIntentUntil = 0
+      end
       if inFlight and inFlight.id == id then
         inFlight = nil
       end
@@ -400,7 +414,8 @@ local function startOp(kind, raw, timeout, isProbe, fan)
     handleResult({ kind = kind, raw = raw, fan = fan }, { spawnFailed = true, exitCode = -1 })
     return
   end
-  inFlight = { id = id, kind = kind, raw = raw, fan = fan, startedAt = now(), probe = isProbe }
+  local bypass = (kind ~= "read") and (now() <= userIntentUntil)
+  inFlight = { id = id, kind = kind, raw = raw, fan = fan, startedAt = now(), probe = isProbe, bypass = bypass }
   local argv = buildArgv(path, { kind = kind, raw = raw, fan = fan })
   local started = noctalia.runAsync(argv, function(result)
     pcall(onOpDone, id, result)
@@ -421,6 +436,11 @@ local function schedulerExitHandback()
     return false
   end
   local ok = pcall(noctalia.runAsync, { path, "auto" }, nil, 2000)
+  if ok then
+    -- 交还已发出:立即按 auto 语义收尾,避免后续 tick 补发第二个 auto
+    appliedMode = MODE_AUTO
+    appliedRaw = nil
+  end
   return ok == true
 end
 
@@ -456,9 +476,17 @@ schedulerTick = function()
     return
   end
 
-  -- 退避期:不重发同一次意图
-  if nowMs < health.backoffUntil then
+  -- 退避期:读/写各自看自己的期限;用户主动操作可穿透一次(仅 auto/写)
+  local userBypass = (nowMs <= userIntentUntil) and not bypassUsed
+  if nowMs < health.backoffUntil.read and nowMs < health.backoffUntil.write then
     return
+  end
+  local readBackoff = nowMs < health.backoffUntil.read
+  local writeBackoff = nowMs < health.backoffUntil.write
+  if userBypass and (desired.mode == MODE_AUTO or writeBackoff) then
+    readBackoff = false
+    writeBackoff = false
+    bypassUsed = true
   end
 
   -- 写:先把待写目标入队(去抖合并),再按「轮」下发左右两路
@@ -468,7 +496,7 @@ schedulerTick = function()
     -- 放弃未完成的写轮次:auto 应接管,不再补写另一路
     writeStage = nil
     writeRoundRaw = nil
-    if appliedMode ~= MODE_AUTO then
+    if appliedMode ~= MODE_AUTO and not writeBackoff then
       startOp("auto", nil, WATCHDOG_MS.auto, false)
       return
     end
@@ -494,8 +522,8 @@ schedulerTick = function()
       return
     end
 
-    -- 第一轮:冻结当前目标,先写右路
-    if pendingWrite and nowMs >= (writeDueAt or 0)
+    -- 第一轮:冻结当前目标,先写右路;写退避期不写
+    if pendingWrite and nowMs >= (writeDueAt or 0) and not writeBackoff
       and nowMs - lastWriteAt >= EC_WRITE_MIN_INTERVAL_MS then
       writeRoundRaw = pendingWrite.raw
       pendingWrite = nil
@@ -507,8 +535,8 @@ schedulerTick = function()
     end
   end
 
-  -- 读:按 poll 节奏,且避开刚写完的锁竞争窗口
-  if nowMs >= nextReadAt and nowMs >= statusEarliestAt then
+  -- 读:按 poll 节奏,且避开刚写完的锁竞争窗口;读退避期不读
+  if not readBackoff and nowMs >= nextReadAt and nowMs >= statusEarliestAt then
     startOp("read", nil, WATCHDOG_MS.read, false)
   end
 end
@@ -651,6 +679,7 @@ local function engineEnterMode(mode, raw)
     desired.mode = MODE_AUTO
     desired.targetRaw = nil
     curveTemp = nil
+    schedulerMarkUserIntent()
   elseif mode == MODE_MANUAL then
     desired.mode = MODE_MANUAL
     if raw ~= nil then
