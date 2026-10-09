@@ -495,16 +495,15 @@ schedulerTick = function()
     end
 
     -- 第一轮:冻结当前目标,先写右路
-    if pendingWrite and nowMs >= (writeDueAt or 0) then
-      if nowMs - lastWriteAt >= EC_WRITE_MIN_INTERVAL_MS then
-        writeRoundRaw = pendingWrite.raw
-        pendingWrite = nil
-        writeDueAt = nil
-        lastWriteAt = nowMs
-        writeStage = "fan0"
-        startOp("write", writeRoundRaw, WATCHDOG_MS.write, false, 0)
-        return
-      end
+    if pendingWrite and nowMs >= (writeDueAt or 0)
+      and nowMs - lastWriteAt >= EC_WRITE_MIN_INTERVAL_MS then
+      writeRoundRaw = pendingWrite.raw
+      pendingWrite = nil
+      writeDueAt = nil
+      lastWriteAt = nowMs
+      writeStage = "fan0"
+      startOp("write", writeRoundRaw, WATCHDOG_MS.write, false, 0)
+      return
     end
   end
 
