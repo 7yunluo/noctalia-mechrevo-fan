@@ -114,7 +114,7 @@ local function statusSection()
     (snap.writable == false) and ui.label({
       text = tostring(snap.error or ""),
       fontSize = 10,
-      color = "error",
+      color = "on_surface_variant",
       maxLines = 2,
     }) or ui.box({}),
   })
