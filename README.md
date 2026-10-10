@@ -85,3 +85,16 @@ sudo dkms install mechrevo-drivers/4.22.3 -k <新内核版本>
 │   └── translations/          # zh-Hans + en
 └── install.sh                 # 一键部署 helper + udev
 ```
+
+## 故障排查:抓风扇被拉满的写者
+
+`scripts/trace-fan-writers.sh` 用 ftrace kprobe 记录内核侧所有风扇 EC 写操作的调用者与参数。排查「风扇被钉在异常转速」时:
+
+```
+sudo scripts/trace-fan-writers.sh start
+# ...复现问题...
+sudo scripts/trace-fan-writers.sh dump   # 存 /var/log/fan-trace.log 并预览
+sudo scripts/trace-fan-writers.sh stop
+```
+
+输出里每行带进程名/PID,可直接看出是 tccd、mechrevo-fanctl 还是别的进程在写。
