@@ -33,6 +33,10 @@ local TEMP_REAPPLY_DELTA_C = 2 -- 曲线模式下重算目标的温度变化阈�
 local POST_WRITE_SETTLE_MS = 1500 -- 写完成后延迟多久才允许读
 local USER_INTENT_BYPASS_MS = 1000 -- 用户主动操作可穿透去抖的窗口
 
+-- 模式守卫:意图与 EC 实际模式漂移后的纠正节奏
+local MODE_DRIFT_STREAK = 3 -- 连续读到漂移的确认拍数
+local MODE_GUARD_MIN_INTERVAL_MS = 10000 -- 两次纠正动作的最小间隔
+
 local BACKOFF_BASE_MS = 2000 -- 失败退避基数
 local BACKOFF_MAX_MS = 60000 -- 失败退避上限
 local SILENT_PROBE_MS = 60000 -- 静默/卡死态的慢探间隔
@@ -202,6 +206,8 @@ local nextReadAt = 0
 local probeAt = 0
 local userIntentUntil = 0
 local bypassUsed = false -- 本次退避内已用掉一次穿透
+local modeDriftCount = 0 -- 连续读到模式漂移的拍数
+local modeGuardAt = 0 -- 上次守卫纠正时刻
 
 -- 标记用户主动操作,允许一次穿透去抖/退避
 local function schedulerMarkUserIntent()
@@ -310,6 +316,7 @@ local schedulerTick
 local engineRecomputeTarget
 local publish
 local savePersist
+local modeGuardCheck
 
 -- 一次 Op 的结果处理(在 pcall 内运行)
 local function handleResult(op, result)
@@ -322,6 +329,7 @@ local function handleResult(op, result)
         clearHealthy("read")
         appliedProbed = true -- 首次读通即确认 EC 可达
         nextReadAt = nowMs + pollInterval()
+        modeGuardCheck()
         engineRecomputeTarget()
         publish()
         return
@@ -635,6 +643,48 @@ local function manualSeedRaw()
   return math.floor(RAW_MAX / 2)
 end
 
+-- 模式守卫:对账 EC 实际模式位(0x0751 的 0x40)与当前意图
+-- auto 意图下被外部拉回手动 / 手动·曲线意图下被外部交还,都视为漂移
+modeGuardCheck = function()
+  if actual.lastReadAt <= 0 then
+    return
+  end
+  local nowMs = now()
+  if nowMs - modeGuardAt < MODE_GUARD_MIN_INTERVAL_MS then
+    return
+  end
+  local ecManual = (actual.mode_reg & 0x40) ~= 0
+  local manualIntent = desired.mode == MODE_MANUAL or desired.mode == MODE_CURVE
+  local drifted = (manualIntent and not ecManual) or (desired.mode == MODE_AUTO and ecManual)
+  -- 手动·曲线下目标尚未写落地时不判定,避免把在途写当漂移
+  if manualIntent and appliedRaw == nil then
+    drifted = false
+  end
+  if not drifted then
+    modeDriftCount = 0
+    return
+  end
+  modeDriftCount = modeDriftCount + 1
+  if modeDriftCount < MODE_DRIFT_STREAK then
+    return
+  end
+  modeDriftCount = 0
+  modeGuardAt = nowMs
+  if manualIntent then
+    -- EC 已被交还:清掉已应用值,让调度器重写当前目标重新接管
+    appliedRaw = nil
+  else
+    -- EC 被外部拉回手动:交还自动
+    desired.mode = MODE_AUTO
+    desired.targetRaw = nil
+    curveTemp = nil
+    appliedMode = nil
+    appliedRaw = nil
+    savePersist()
+  end
+  pcall(noctalia.log, "[mechrevo-fan] mode drift corrected: mode_reg=" .. tostring(actual.mode_reg))
+end
+
 -- 重算当前模式的生效目标(写 desired.targetRaw,不发 EC 写)
 engineRecomputeTarget = function()
   if desired.mode == MODE_MANUAL then
@@ -892,6 +942,8 @@ function onEnable()
   desired.targetRaw = nil
   -- 上次退出可能没交还(崩溃),EC 模式未知:交由调度器补一次 auto
   appliedMode = nil
+  modeDriftCount = 0
+  modeGuardAt = 0
   noctalia.setUpdateInterval(SCHED_TICK_MS)
   publish()
   schedulerRequestRead()
