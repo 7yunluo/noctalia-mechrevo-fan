@@ -1,100 +1,203 @@
-# noctalia-mechrevo-fan
+# noctalia-mechrevo-fan · 重构版
 
-Noctalia v5 状态栏风扇插件 + Uniwill EC 风扇控制 helper,用于机械革命 WUJIE 系列的
-双风扇机器(本机:WUJIE Series-X5SP4NAG,Ryzen AI 9 H 365)。
+机械革命 WUJIE 笔记本的 Noctalia v5 风扇控制插件，通过 `mechrevo-fanctl` 和
+`/dev/tuxedo_io` 读取风扇状态、设置双风扇占空比，以及交还 EC 自动控制。
 
-- 状态栏部件:显示 `占空比% 温度°`;点击循环切换 自动 → 曲线 → 手动;右键开控制面板
-- 控制面板:模式切换 / 曲线选择(安静·均衡·性能)/ 手动滑块 / 硬件状态卡片
-- 过热保护:温度达到阈值(默认 95°C)自动交还 EC,并发通知
-- 后台服务:周期轮询风扇状态,manual/curve 模式下周期重施目标值,插件退出时交还 EC
+**当前仓库为重构版本。** 后台服务改为串行执行硬件操作，统一处理模式切换、目标下发、
+读回验证和异常恢复；状态栏和面板同步更新，区分“正在下发”和“已验证生效”。
 
-## 实测记录(2026-10-09,驱动 4.22.3 + 内核 7.2.8-zen)
+适配与实测机型为 **WUJIE Series-X5SP4NAG / Ryzen AI 9 H 365**。其他机械革命或
+Uniwill 机型的 EC 行为可能不同，驱动中的共享风扇表适配只针对上述主板型号。
 
-在**未打驱动补丁**的官方 4.22.3 上直接测试 ioctl 写入:
+## 重构内容
 
-| 操作 | 结果 |
-|---|---|
-| `W_UW_FANSPEED`(fan0→0x1804)写 200/120/40 | 占空比随写入变化,**有效** |
-| `W_UW_FANSPEED2`(fan1→0x1809)写 150/200 | `fan1` 读数不变,**无效** |
-| `W_UW_FANAUTO` | 恢复自动模式,两风扇重新受 EC 控制,**有效** |
+- **串行调度**：读取、双路写入和恢复自动控制逐个执行；操作进行中合并新的目标，避免并发调用 helper。
+- **双风扇读回验证**：新增 `set-both`，在同一 helper 进程和设备锁内依次写入两路，再输出状态。服务按读回占空比判断是否生效。
+- **持续维持目标**：手动和曲线模式每秒重施目标，即使目标未变化也会继续下发，以应对 EC 固件覆盖。
+- **故障恢复**：温度无效、读数超过 15 秒未更新、达到保护温度或连续三次双路读回不匹配时，请求恢复自动控制；写入失败也会触发交还。
+- **界面反馈**：面板显示等待验证、生效和错误提示；滑块拖动期间保留预览，命令带唯一标识。
+- **启动与退出交还**：每次启动先执行 `auto`；退出时启动独立进程尝试交还 EC。只保存手动目标与曲线选择，重启插件后从自动模式开始。
+- **回归测试**：用模拟 Noctalia 宿主测试真实服务代码，覆盖调度、曲线、读回验证和保护逻辑。
 
-当时据此得出「只有 fan0 能直控、fan1 写入无效」的结论。后续逐行核对内核源码发现,
-上表这几次 fan1 写入是在全风扇模式已关闭(`0x0751` bit6 未置位)时做的:官方
-`uw_set_fan()` 在这种情况下会先调 `uw_init_fan()`,而该函数会读 `0x07c5`/`0x07c6`
-并回写;随后落到寄存器上的写入并未被 EC 采纳,读数因此不变。也就是说,「无效」来自
-初始化那一步,而不是 fan1 写不进去。(2026-10-09 之前的补丁在这条路径上尤其危险:
-初始化会做持锁的 WMI 重试,连写 fan1 可把 EC 卡死。)
+## 功能
 
-新版补丁(2026-10-09,4 hunk:decl / init 早退 / dmi / setfan)给 `uw_init_fan()` 加了
-`fans_initialized` 早退,让稳态写入只做单次寄存器写,不再触发上述初始化。按这条路径,
-**未打补丁时 fan1 同样能直控**;补丁的意义因此不再是「能不能写」,而是写到正确的表——
-WUJIE 机型左右风扇共用同一张 CPU 表,补丁让 fan1 用 CPU 表地址 `0x0f20`,而不是 EC
-不响应的 GPU 表地址 `0x0f50`。
+| 模式 | 行为 |
+| --- | --- |
+| 自动 | 由 EC 固件控制风扇，插件定期读取状态 |
+| 曲线 | 按温度线性插值，提供安静、均衡、性能三条曲线 |
+| 手动 | 用滑块设置两路相同的目标占空比 |
 
-### EC 行为(实测)
-- 写入值 < 约 25%(原始值 50)时,EC 会把持续占空比夹到最低档(读数约 8~26);
-  写入 `0` 后约 3 分钟内会被抬到约 13%。这是 EC 固件行为,驱动注释里亦有记载。
-- 温度读数:`temp0`(0x043e)返回 CPU 侧温度;`temp1`(0x044f)恒为 0,不可用。
+状态栏显示两路风扇中较高的占空比及温度，左键按 **自动 → 曲线 → 手动** 循环切换，
+右键打开控制面板。面板分别显示左右风扇读数，并提供模式、曲线和手动滑块。
+
+百分比是风扇占空比，原始值范围为 `0–200`，`200` 对应 `100%`；读数不是 RPM。
 
 ## 安装
 
-- **helper 编译 + udev 规则 + 探测**:运行 `./install.sh`,一键完成
-- **驱动补丁(让左风扇写入共享 CPU 表)**:运行 `sudo python3 scripts/apply-driver-patch.py`,再执行:
+### 环境要求
+
+- Linux，以及提供 `/dev/tuxedo_io` 的 `mechrevo-drivers` / `tuxedo-drivers`。
+- Noctalia v5，支持插件 API 24。
+- `gcc`、`udev`、`sudo`；应用驱动补丁还需要 Python 3、DKMS 和对应内核头文件。
+- 当前用户有权读写 `/dev/tuxedo_io`；仓库提供的 udev 规则使用 `plugdev` 组。
+
+参考硬件环境为上述 WUJIE 机型、驱动 `4.22.3`、内核 `7.2.8-zen`。
+
+### 1. 安装 helper 和设备权限规则
 
 ```sh
-sudo dkms remove mechrevo-drivers/4.22.3 --all
-sudo dkms install mechrevo-drivers/4.22.3 -k <新内核版本>
+git clone https://github.com/7yunluo/noctalia-mechrevo-fan.git
+cd noctalia-mechrevo-fan
+./install.sh
 ```
 
-打完补丁后重启,左风扇写入共享 CPU 表。注意:驱动包升级会覆盖 `/usr/src/`,补丁需重打。
+脚本将 helper 编译安装到 `~/.local/bin/mechrevo-fanctl`，安装 udev 规则，然后执行
+一次状态探测。以普通用户运行脚本，安装系统规则时脚本会调用 `sudo`。
 
-## 使用
+如果提示权限不足，确认系统存在 `plugdev` 组，并将当前用户加入该组：
 
-- **状态栏部件**:显示 `占空比% 温度°`,点击循环切换 自动 → 曲线 → 手动;右键打开控制面板
-- **控制面板**:三种模式(自动/曲线/手动)、手动滑块、风扇曲线选择、状态展示
-- **CLI**:`mechrevo-fanctl status` 查看状态;`set 0 <raw>` 设右风扇;`set 1 <raw>` 设左风扇(打补丁后写入共享 CPU 表);`auto` 交还 EC
-
-## 排障
-
-- `mechrevo-fanctl status` 报 `Permission denied`:检查 `/dev/tuxedo_io` 属组是否为 `plugdev`,当前用户是否在 `plugdev` 组
-- 左风扇 `set 1` 读数不变:确认驱动补丁是否生效(`set 1` 走 GPU 表 `0x0f50` 时读数不会跟随),参照上文「安装」节重打补丁
-- 部件显示 `--`:运行 `noctalia msg plugins list` 确认插件已启用,再检查 `~/.local/bin/mechrevo-fanctl` 是否存在
-
-## 背景:为什么需要这个插件
-
-这台机械革命(WUJIE X5SP4NAG)的 Uniwill EC 有个怪癖:**左风扇**(CPU 侧)在官方驱动(TUXEDO/tuxedo-drivers,4.22.x)里被分到 GPU 曲线表(`0x0f50`),而这块 EC 不响应那张表,导致左风扇停转(停在最低档 ≈25%)。两个风扇只有在「自动」模式下才都转,但自动模式的转速曲线不可调。
-
-本插件绕开 EC 自动模式,经 `/dev/tuxedo_io` 直写风扇寄存器。历史的驱动补丁修复
-(两风扇共用 CPU 表 `0x0f20`)在 2026-09-22 驱动包升级 4.22.1 → 4.22.3 时被覆盖,
-由 `scripts/apply-driver-patch.py` 重新固化——把 `uw_set_fan()` 里 fan1 的目标表
-从 GPU 表改回 CPU 表,让左风扇的写入落到这张共享表上。补丁的作用不是「让 fan1 能写」
-(这条写路径本身是通的),而是让 fan1 写到 EC 真正响应的 CPU 表地址。
-
-## 仓库结构
-
-```
-.
-├── helper/mechrevo-fanctl.c   # C 小工具:经 /dev/tuxedo_io 直读写 EC 风扇寄存器
-├── udev/60-mechrevo-fanctl.rules  # 赋予 plugdev 组 /dev/tuxedo_io 读写权
-├── scripts/apply-driver-patch.py  # 驱动补丁:修 fan1 写入 CPU 表而非 GPU 表
-├── mechrevo-fan/              # Noctalia 插件本体(服务 + 部件 + 面板)
-│   ├── plugin.toml            # 清单:service + bar widget + panel + 设置项
-│   ├── service.luau           # 轮询/写风扇/曲线/过热保护
-│   ├── widget.luau            # 状态栏部件
-│   ├── panel.luau             # 控制面板
-│   └── translations/          # zh-Hans + en
-└── install.sh                 # 一键部署 helper + udev
+```sh
+sudo usermod -aG plugdev "$USER"
 ```
 
-## 故障排查:抓风扇被拉满的写者
+重新登录后检查设备权限，再运行 `~/.local/bin/mechrevo-fanctl status`。
 
-`scripts/trace-fan-writers.sh` 用 ftrace kprobe 记录内核侧所有风扇 EC 写操作的调用者与参数。排查「风扇被钉在异常转速」时:
+### 2. 接入 Noctalia
 
+在仓库目录执行：
+
+```sh
+noctalia msg plugins source add mechrevo path "$PWD"
+noctalia msg plugins enable 7yunluo/mechrevo-fan
 ```
+
+然后在 Noctalia 状态栏配置中添加插件的 `fan` 部件。插件源引用本地仓库路径，
+请保留该目录；如果曾用其他路径添加同名源，先移除旧源再添加。
+
+### 3. WUJIE 驱动补丁
+
+`scripts/apply-driver-patch.py` 为驱动源码应用以下修复：
+
+- 让重复启用全风扇模式保持幂等，避免意外清除模式位。
+- 初始化完成后提前返回，避免稳态写入重复初始化。
+- 识别 `WUJIE Series-X5SP4NAG`，调整初始化，并在共享表路径中让 fan1 使用 CPU 风扇表。
+- 为旧控制路径的自动模式写入增加回读重试，驱动卸载时交还 EC。
+
+脚本默认选择 `/usr/src/mechrevo-drivers-*/uniwill_keyboard.h` 中版本最高的源码，
+也支持显式指定文件。它会保留首次修改前的 `.orig` 备份，支持重复执行，
+锚点缺失或不唯一时退出，不写入部分补丁。
+
+以驱动 `4.22.3` 和当前内核为例；请将版本变量改成实际安装的驱动版本：
+
+```sh
+DRIVER_VERSION=4.22.3
+sudo python3 scripts/apply-driver-patch.py "/usr/src/mechrevo-drivers-${DRIVER_VERSION}/uniwill_keyboard.h"
+sudo dkms remove "mechrevo-drivers/${DRIVER_VERSION}" --all
+sudo dkms install "mechrevo-drivers/${DRIVER_VERSION}" -k "$(uname -r)"
+```
+
+完成后重启，使新驱动生效。`--all` 会移除该驱动版本在所有内核上的 DKMS 安装，
+上面的安装命令只为当前内核重建；需要使用其他内核时，也要为其安装。
+驱动包升级可能覆盖 `/usr/src` 中的修改，升级后需重新应用补丁并重建。
+
+## 从旧版迁移
+
+更新仓库后，重新运行 `./install.sh` 安装带 `set-both` 和设备锁的新 helper，
+再重新加载或重新启用 Noctalia 插件。服务和 helper 应一起更新。
+
+重构版不恢复上次的手动或曲线模式；启动后先交还 EC，再由用户选择控制模式。
+手动目标占空比和曲线选择仍会保存。
+
+旧补丁曾通过 `oldctl` 将 WUJIE 加入旧风扇控制路径的例外表。当前脚本已移除这条补丁，
+**但不会自动撤销已经应用的 `oldctl` 修改**。如果使用过该补丁，请从干净的同版本
+驱动源码重新应用当前补丁，再重建 DKMS，避免保留旧路径配置。
+
+## 设置
+
+| 设置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `poll_interval_ms` | `2000` | 自动模式状态轮询间隔，可设为 1000–10000 ms；手动和曲线模式每秒写入并读回 |
+| `sensor` | `cpu` | 使用 CPU 温度，或两路温度中的最大值 `max` |
+| `curve` | `balanced` | 默认曲线：`quiet` / `balanced` / `performance` |
+| `min_fan_percent` | `0` | 曲线模式的目标下限，范围 0–60%；仍受 EC 最低档行为影响 |
+| `safety_temp_c` | `95` | 保护温度，范围 70–105°C |
+| `helper_path` | `~/.local/bin/mechrevo-fanctl` | helper 可执行文件路径 |
+
+保护逻辑会请求恢复 EC 自动控制并显示原因。设备无响应或驱动调用阻塞时，
+实际交还仍取决于 helper 和驱动能否完成操作；服务等待当前操作返回，避免叠加调用。
+
+## 命令行
+
+如果 `~/.local/bin` 已在 `PATH` 中，可以直接运行：
+
+```sh
+mechrevo-fanctl status         # 输出 JSON 状态
+mechrevo-fanctl set-both 120   # 两路目标均设为 60%，写入后输出 JSON 状态
+mechrevo-fanctl set 0 120      # 设置右风扇（fan0）
+mechrevo-fanctl set 1 120      # 设置左风扇（fan1）
+mechrevo-fanctl auto           # 交还 EC 自动控制
+```
+
+`set-both` 在同一设备锁内依次写入两路；写入或随后状态读取失败时，会尝试交还 EC。
+设备锁用于协调 helper 进程，其他直接访问 EC 的工具仍可能覆盖目标。
+CLI 的 `set` / `set-both` 是一次性操作，每秒维持目标和温度保护由插件服务提供。
+
+退出码：`0` 成功，`1` 设备或写入错误，`2` 参数错误，`3` 设备不存在，
+`4` 权限不足，`5` 关键状态读取失败，`6` 另一个 helper 操作正在执行。
+
+## 硬件限制与排障
+
+- **低占空比不等于停转**：在实测机型上，EC 会调整低于约 25% 的请求值，
+  `0` 目标也可能在一段时间后被抬到最低档。插件保留用户目标，但实际占空比以读回为准。
+- **第二路温度不可用**：实测 `temp0` 返回 CPU 侧温度，`temp1` 恒为 `0`。
+  第二路温度或最低转速字段读取失败不会单独使 helper 的整体状态失败。
+- **左风扇不跟随**：检查驱动补丁及 DKMS 是否生效，特别是共享 CPU 表适配和旧 `oldctl` 修改。
+  服务不会仅凭 ioctl 成功就宣告控制生效，连续三次读回不匹配后会请求自动模式。
+- **部件显示 `--`**：用 `noctalia msg plugins list` 检查插件，再运行
+  `~/.local/bin/mechrevo-fanctl status`，在面板查看具体错误。
+- **`Permission denied`**：检查设备属组、udev 规则和当前登录会话的 `plugdev` 组成员资格。
+- **操作繁忙或目标被覆盖**：检查是否有其他 helper、tccd 或风扇管理工具同时访问设备。
+
+需要定位内核侧 EC 写入来源时，可使用 ftrace 脚本：
+
+```sh
 sudo scripts/trace-fan-writers.sh start
-# ...复现问题...
-sudo scripts/trace-fan-writers.sh dump   # 存 /var/log/fan-trace.log 并预览
+# 复现问题
+sudo scripts/trace-fan-writers.sh dump
 sudo scripts/trace-fan-writers.sh stop
 ```
 
-输出里每行带进程名/PID,可直接看出是 tccd、mechrevo-fanctl 还是别的进程在写。
+`dump` 保存到 `/var/log/fan-trace.log` 并预览，记录中包含进程名、PID 和写入参数，
+用于定位异常转速的写入者。
+
+## 开发与验证
+
+无需硬件即可运行服务回归测试（Lua 5.2 或更新版本）：
+
+```sh
+lua tests/service_test.lua
+gcc -Wall -Wextra -Werror -fsyntax-only helper/mechrevo-fanctl.c
+bash -n install.sh scripts/trace-fan-writers.sh
+```
+
+服务测试通过模拟时间、硬件返回值和异步回调验证调度与保护逻辑。
+实际 EC 响应、驱动补丁和 Noctalia 界面仍需在目标机器上验证。
+
+## 仓库结构
+
+```text
+.
+├── helper/mechrevo-fanctl.c        # ioctl helper、设备锁、双路写入与状态输出
+├── mechrevo-fan/
+│   ├── plugin.toml                # 插件清单与设置
+│   ├── service.luau               # 串行调度、曲线、读回验证与保护
+│   ├── widget.luau                # 状态栏部件
+│   ├── panel.luau                 # 控制面板
+│   └── translations/              # 简体中文与英文
+├── scripts/
+│   ├── apply-driver-patch.py       # WUJIE 驱动补丁
+│   └── trace-fan-writers.sh        # EC 写入来源取证
+├── tests/service_test.lua         # 模拟宿主下的服务回归测试
+├── udev/60-mechrevo-fanctl.rules   # plugdev 设备权限规则
+└── install.sh                    # helper 与 udev 安装
+```

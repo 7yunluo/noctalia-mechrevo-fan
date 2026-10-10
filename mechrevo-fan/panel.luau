@@ -22,12 +22,14 @@ local MODE_AUTO = "auto"
 local MODE_MANUAL = "manual"
 local MODE_CURVE = "curve"
 
-local CURVE_NAMES = { "quiet", "balanced", "performance" }
+local commandSeq = 0
 -- 滑块预览值:拖拽中以及松手后等待服务确认期间使用,避免回弹到旧值
 local sliderPreview = nil
 local render -- 前向声明:各控件的回调在 render 定义前引用它
 
 local function send(payload)
+  commandSeq = commandSeq + 1
+  payload.requestId = tostring(noctalia.nowMs()) .. ":" .. tostring(commandSeq)
   noctalia.state.set(COMMAND, payload)
 end
 
@@ -57,7 +59,7 @@ local function modeButton(mode)
     text = modeLabel(mode),
     variant = active and "primary" or "outline",
     flexGrow = 1,
-    enabled = controlsEnabled(),
+    enabled = mode == MODE_AUTO or controlsEnabled(),
     onClick = function()
       sliderPreview = nil
       send({ action = "set_mode", mode = mode })
@@ -110,8 +112,10 @@ local function statusSection()
       fontSize = 10,
       color = "on_surface_variant",
     }) or ui.box({}),
-    -- helper 卡住或不可写时的只读状态行
-    (snap.writable == false) and ui.label({
+    snap.pending and ui.label({
+      text = noctalia.tr("panel.pending_hint"), fontSize = 10, color = "on_surface_variant",
+    }) or ui.box({}),
+    (snap.error ~= nil and snap.error ~= "") and ui.label({
       text = tostring(snap.error or ""),
       fontSize = 10,
       color = "on_surface_variant",
@@ -124,7 +128,7 @@ local function manualSection()
   local scale = tonumber(snap.scale) or 200
   local shown = sliderPreview
   if shown == nil then
-    shown = tonumber(snap.targetRaw) or 0
+    shown = tonumber(snap.manualRaw) or tonumber(snap.targetRaw) or 100
   end
   local enabled = (snap.modeName or MODE_AUTO) == MODE_MANUAL and controlsEnabled()
   return ui.column({ key = "manual", gap = 6 }, {
@@ -145,7 +149,8 @@ local function manualSection()
       enabled = enabled,
       onChange = function(v)
         sliderPreview = tonumber(v) or shown
-        render()
+        -- The service coalesces updates while one hardware operation is running.
+        send({ action = "set_raw", raw = sliderPreview })
       end,
       onDragEnd = function(v)
         -- 保留预览值直到服务确认(targetRaw 追上),否则快照回传旧值会让滑块回弹
@@ -204,6 +209,7 @@ noctalia.state.watch(SNAPSHOT, function(val)
     if sliderPreview ~= nil and tonumber(snap.targetRaw) == sliderPreview then
       sliderPreview = nil
     end
+    if snap.modeName ~= MODE_MANUAL then sliderPreview = nil end
     render()
   end
 end)

@@ -9,7 +9,8 @@
     "fan_left": "左风扇",
     "fan_right": "右风扇",
     "temp": "温度",
-    "live_hint": "手动/曲线模式生效中,点击「自动」交还 EC 控制"
+    "live_hint": "手动/曲线模式生效中,点击「自动」交还 EC 控制",
+    "pending_hint": "正在下发并验证转速…"
   },
   "widget": {
     "mode": {
@@ -24,7 +25,7 @@
       "temp": "温度",
       "error": "错误"
     },
-    "left_unavailable": "不可用(驱动未打补丁)"
+    "left_unavailable": "读数不可用"
   },
   "error": {
     "device-missing": "找不到设备节点",
@@ -34,7 +35,12 @@
     "parse": "无法解析 helper 输出",
     "write-failed": "设置风扇转速失败",
     "invalid-args": "helper 拒绝了参数",
-    "helper-stuck": "helper 无响应,等待其自行返回"
+    "helper-stuck": "helper 无响应,等待其自行返回",
+    "busy": "另一个风扇操作正在执行",
+    "sensor-stale": "温度读数过期，已请求恢复自动",
+    "sensor-invalid": "温度读数无效",
+    "overheat": "达到保护温度，已请求恢复自动",
+    "control-not-applied": "两路转速未跟随目标，已请求恢复自动"
   },
   "curve": {
     "quiet": "安静",
@@ -65,7 +71,7 @@
     },
     "min_fan_percent": {
       "label": "最低转速下限(%)",
-      "description": "曲线模式下的转速下限,0 表示允许停转"
+      "description": "曲线转速下限；低于 25% 时 EC 可能仍保持最低档"
     },
     "safety_temp_c": {
       "label": "保护温度(°C)",

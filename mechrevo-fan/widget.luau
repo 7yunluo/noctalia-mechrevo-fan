@@ -3,6 +3,7 @@
 
 local SNAPSHOT = "mechrevo_fan.status"
 local COMMAND = "mechrevo_fan.command"
+local commandSeq = 0
 
 local snap = noctalia.state.get(SNAPSHOT) or {
   ok = false,
@@ -37,7 +38,7 @@ local function displayFan()
 end
 
 local function displayText()
-  if not snap.ok then
+  if not snap.ok or (snap.error ~= nil and snap.error ~= "") then
     return "--"
   end
   local mainRaw = displayFan()
@@ -114,7 +115,8 @@ function onConfigChanged()
 end
 
 function onClick()
-  noctalia.state.set(COMMAND, { action = "cycle_mode" })
+  commandSeq = commandSeq + 1
+  noctalia.state.set(COMMAND, { action = "cycle_mode", requestId = tostring(noctalia.nowMs()) .. ":" .. tostring(commandSeq) })
 end
 
 function onRightClick()

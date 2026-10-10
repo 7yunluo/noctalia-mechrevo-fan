@@ -9,7 +9,8 @@
     "fan_left": "Left Fan",
     "fan_right": "Right Fan",
     "temp": "Temp",
-    "live_hint": "Manual/curve mode active; click Auto to hand control back to the EC"
+    "live_hint": "Manual/curve mode active; click Auto to hand control back to the EC",
+    "pending_hint": "Applying and checking fan speeds…"
   },
   "widget": {
     "mode": {
@@ -24,7 +25,7 @@
       "temp": "Temp",
       "error": "Error"
     },
-    "left_unavailable": "unavailable (driver patch missing)"
+    "left_unavailable": "Reading unavailable"
   },
   "error": {
     "device-missing": "Device node not found",
@@ -34,7 +35,12 @@
     "parse": "Could not parse helper output",
     "write-failed": "Failed to set fan speed",
     "invalid-args": "Helper rejected its arguments",
-    "helper-stuck": "Helper is not responding; waiting for it to return"
+    "helper-stuck": "Helper is not responding; waiting for it to return",
+    "busy": "Another fan operation is in progress",
+    "sensor-stale": "Temperature is stale; automatic control requested",
+    "sensor-invalid": "Invalid temperature reading",
+    "overheat": "Safety temperature reached; automatic control requested",
+    "control-not-applied": "Both fans did not follow the target; automatic control requested"
   },
   "curve": {
     "quiet": "Quiet",
@@ -65,7 +71,7 @@
     },
     "min_fan_percent": {
       "label": "Minimum speed floor (%)",
-      "description": "Speed floor in curve mode; 0 allows the fans to stop"
+      "description": "Curve speed floor; below 25% the EC may keep its minimum speed"
     },
     "safety_temp_c": {
       "label": "Safety temperature (°C)",

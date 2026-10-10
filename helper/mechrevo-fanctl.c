@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 
 #define IOCTL_MAGIC 0xEC
 #define MAGIC_READ_UW  (IOCTL_MAGIC + 3)
@@ -40,7 +41,7 @@
 /* 打开设备节点,区分「不存在」与「权限不足」两种失败。 */
 static int open_dev(void)
 {
-    int fd = open("/dev/tuxedo_io", O_RDWR);
+    int fd = open("/dev/tuxedo_io", O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         fprintf(stderr, "open /dev/tuxedo_io: %s\n", strerror(errno));
         if (errno == ENOENT)
@@ -48,6 +49,11 @@ static int open_dev(void)
         if (errno == EACCES || errno == EPERM)
             return -RC_PERMISSION;
         return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr, "another fanctl operation is in progress\n");
+        close(fd);
+        return -6;
     }
     return fd;
 }
@@ -72,9 +78,9 @@ static int cmd_status(int fd)
     ok &= read_or(fd, R_UW_FANSPEED, &fan0);
     ok &= read_or(fd, R_UW_FANSPEED2, &fan1);
     ok &= read_or(fd, R_UW_FAN_TEMP, &temp0);
-    ok &= read_or(fd, R_UW_FAN_TEMP2, &temp1);
+    read_or(fd, R_UW_FAN_TEMP2, &temp1);
     ok &= read_or(fd, R_UW_MODE, &mode);
-    ok &= read_or(fd, R_UW_FANS_MIN_SPEED, &minspeed);
+    read_or(fd, R_UW_FANS_MIN_SPEED, &minspeed);
 
     printf("{\"ok\":%s,\"fan0\":%d,\"fan1\":%d,\"temp0\":%d,\"temp1\":%d,"
            "\"mode\":%d,\"minSpeed\":%d,\"scale\":200}\n",
@@ -110,21 +116,32 @@ int main(int argc, char **argv)
         return rc;
     }
 
-    if (strcmp(cmd, "set") == 0 && argc >= 4) {
+    if ((strcmp(cmd, "set") == 0 && argc == 4) ||
+        (strcmp(cmd, "set-both") == 0 && argc == 3)) {
+        int both = strcmp(cmd, "set-both") == 0;
         char *end;
-        long idx = strtol(argv[2], &end, 10);
-        if (*end || idx < 0 || idx > 1) {
+        errno = 0;
+        long idx = both ? 0 : strtol(argv[2], &end, 10);
+        if (!both && (errno || end == argv[2] || *end || idx < 0 || idx > 1)) {
             fprintf(stderr, "set: fan index must be 0 or 1\n");
             close(fd);
             return 2;
         }
-        long raw = strtol(argv[3], &end, 10);
-        if (*end || raw < 0 || raw > 200) {
+        char *speed = argv[both ? 2 : 3];
+        errno = 0;
+        long raw = strtol(speed, &end, 10);
+        if (errno || end == speed || *end || raw < 0 || raw > 200) {
             fprintf(stderr, "set: speed must be 0-200\n");
             close(fd);
             return 2;
         }
         int rc = cmd_set(fd, (int)idx, raw);
+        if (both && rc == 0)
+            rc = cmd_set(fd, 1, raw);
+        if (both && rc == 0)
+            rc = cmd_status(fd);
+        if (both && rc != 0)
+            ioctl(fd, W_UW_FANAUTO, 0);
         close(fd);
         return rc;
     }
@@ -139,7 +156,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    fprintf(stderr, "usage: mechrevo-fanctl status | set <0|1> <0-200> | auto\n");
+    fprintf(stderr, "usage: mechrevo-fanctl status | set <0|1> <0-200> | set-both <0-200> | auto\n");
     close(fd);
     return 2;
 }
