@@ -653,7 +653,7 @@ modeGuardCheck = function()
   if nowMs - modeGuardAt < MODE_GUARD_MIN_INTERVAL_MS then
     return
   end
-  local ecManual = (actual.mode_reg & 0x40) ~= 0
+  local ecManual = bit32.band(actual.mode_reg, 0x40) ~= 0
   local manualIntent = desired.mode == MODE_MANUAL or desired.mode == MODE_CURVE
   local drifted = (manualIntent and not ecManual) or (desired.mode == MODE_AUTO and ecManual)
   -- 手动·曲线下目标尚未写落地时不判定,避免把在途写当漂移
